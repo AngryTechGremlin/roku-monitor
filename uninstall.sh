@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Remove the roku-monitor-linux user service and CLI shim.
-#   ./uninstall.sh [--purge]     --purge also deletes ~/.config/roku-monitor-linux
+# Remove the roku-monitor user service and CLI shim.
+#   ./uninstall.sh [--purge]     --purge also deletes ~/.config/roku-monitor
 # Note: stopping the service turns the TV off (if ROKU_OFF_ON_STOP is true).
 set -euo pipefail
 
-APP=roku-monitor-linux
+APP=roku-monitor
 BIN_DIR=${XDG_BIN_HOME:-$HOME/.local/bin}
 CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/$APP
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user

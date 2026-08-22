@@ -316,5 +316,105 @@ class WrongDeviceTests(unittest.TestCase):
             rm.parse_active_app("<active-app><app>Roku")
 
 
+class WindowsLogicTests(unittest.TestCase):
+    """The Windows backend's decision logic, exercised without Windows."""
+
+    def test_pnp_vendor_decode(self):
+        self.assertEqual(rm.pnp_vendor(0x4975), "RKU")   # R=18, K=11, U=21
+        self.assertEqual(rm.pnp_vendor(0x10AC), "DEL")
+
+    def test_is_roku_target_handles_byte_order(self):
+        self.assertTrue(rm.is_roku_target(0x4975, "Generic PnP Monitor"))
+        self.assertTrue(rm.is_roku_target(0x7549, "Generic PnP Monitor"))  # byte-swapped
+        self.assertTrue(rm.is_roku_target(0x10AC, "Roku TV"))              # by name
+        self.assertFalse(rm.is_roku_target(0x10AC, "DELL S2722DC"))
+        self.assertFalse(rm.is_roku_target(0, ""))
+
+    def make_daemon(self, **cfg_over):
+        values = {"ROKU_TV_IP": "192.0.2.40", "ROKU_OFF_DELAY_S": "0"}
+        values.update(cfg_over)
+        cfg = rm.Config(values)
+        d = rm.Daemon(cfg, rm.WindowsDisplaySampler(), DaemonDebounceTests.FakeReconciler())
+        d.sampler.display_on = True
+        d.committed = rm.ON
+        return d
+
+    def test_display_off_then_on(self):
+        d = self.make_daemon()
+        rm.handle_win_event(d, rm.EV_DISPLAY, rm.DISPLAY_OFF)   # 1st off sample
+        rm.handle_win_event(d, rm.EV_DISPLAY, rm.DISPLAY_OFF)   # 2nd -> commits
+        self.assertEqual(d.reconciler.requests[-1], (rm.OFF, False))
+        rm.handle_win_event(d, rm.EV_DISPLAY, rm.DISPLAY_ON)
+        self.assertEqual(d.reconciler.requests[-1], (rm.ON, False))
+
+    def test_dimmed_counts_as_on(self):
+        d = self.make_daemon()
+        rm.handle_win_event(d, rm.EV_DISPLAY, rm.DISPLAY_DIMMED)
+        self.assertTrue(d.sampler.display_on)
+        self.assertEqual(d.committed, rm.ON)
+
+    def test_suspend_and_resume(self):
+        d = self.make_daemon()
+        rm.handle_win_event(d, rm.EV_SUSPEND)
+        self.assertTrue(d.sleeping)
+        self.assertEqual(d.reconciler.requests[-1], (rm.OFF, True))
+        rm.handle_win_event(d, rm.EV_RESUME)
+        self.assertFalse(d.sleeping)
+        self.assertEqual(d.off_samples, 0)
+
+    def test_suspend_respects_off_on_sleep_false(self):
+        d = self.make_daemon(ROKU_OFF_ON_SLEEP="false")
+        rm.handle_win_event(d, rm.EV_SUSPEND)
+        self.assertTrue(d.sleeping)
+        self.assertEqual(d.reconciler.requests, [])
+
+    def test_display_events_ignored_while_sleeping(self):
+        d = self.make_daemon()
+        d.sleeping = True
+        rm.handle_win_event(d, rm.EV_DISPLAY, rm.DISPLAY_OFF)
+        rm.handle_win_event(d, rm.EV_DISPLAY, rm.DISPLAY_OFF)
+        self.assertEqual(d.reconciler.requests, [])
+
+    def test_endsession_logoff_and_shutdown(self):
+        for logoff in (True, False):
+            d = self.make_daemon()
+            rm.handle_win_event(d, rm.EV_ENDSESSION, logoff)
+            self.assertTrue(d.shutdown_seen)
+            self.assertEqual(d.reconciler.requests[-1], (rm.OFF, True))
+
+    def test_endsession_respects_off_on_stop_false(self):
+        d = self.make_daemon(ROKU_OFF_ON_STOP="false")
+        rm.handle_win_event(d, rm.EV_ENDSESSION, False)
+        self.assertEqual(d.reconciler.requests, [])
+
+    def test_unknown_event_is_ignored(self):
+        self.assertFalse(rm.handle_win_event(self.make_daemon(), "nonsense"))
+
+    def test_sampler_shape_without_windows(self):
+        s = rm.WindowsDisplaySampler().sample()   # list_windows_targets raises here
+        self.assertTrue(s.pc_on)
+        self.assertEqual(s.connectors, [])
+        self.assertIsNone(s.roku_name)
+
+
+class ConfigPathTests(unittest.TestCase):
+    def test_win32_config_path(self):
+        orig_win, orig_appdata = rm.IS_WIN, os.environ.get("APPDATA")
+        try:
+            rm.IS_WIN = True
+            os.environ["APPDATA"] = os.path.join("C:", "Users", "x", "AppData", "Roaming")
+            self.assertEqual(rm.default_config_path(),
+                             os.path.join("C:", "Users", "x", "AppData", "Roaming", rm.APP, "env"))
+        finally:
+            rm.IS_WIN = orig_win
+            if orig_appdata is None:
+                os.environ.pop("APPDATA", None)
+            else:
+                os.environ["APPDATA"] = orig_appdata
+
+    def test_posix_config_path(self):
+        self.assertTrue(rm.default_config_path().endswith(os.path.join(rm.APP, "env")))
+
+
 if __name__ == "__main__":
     unittest.main()

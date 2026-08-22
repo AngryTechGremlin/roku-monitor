@@ -1,21 +1,21 @@
 [Unit]
 Description=Roku TV as a monitor: mirror what the GPU is driving (power + input)
-Documentation=https://github.com/AngryTechGremlin/roku-monitor-linux
+Documentation=https://github.com/AngryTechGremlin/roku-monitor
 # Runs for the life of the graphical session: starts at desktop login, stops
 # (SIGTERM -> TV off) at logout. default.target would also fire for SSH logins.
 After=graphical-session.target
 PartOf=graphical-session.target
 # A persistently crashing daemon stops after 5 tries in a minute and stays
-# visible as 'failed' (reset: systemctl --user reset-failed roku-monitor-linux).
+# visible as 'failed' (reset: systemctl --user reset-failed roku-monitor).
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
 Type=exec
-# ~/.local/bin/roku-monitor-linux is a symlink to the clone, made by install.sh.
-# Config is read by the script itself from ~/.config/roku-monitor-linux/env, so
+# ~/.local/bin/roku-monitor is a symlink to the clone, made by install.sh.
+# Config is read by the script itself from ~/.config/roku-monitor/env, so
 # the CLI and the service always agree.
-ExecStart=%h/.local/bin/roku-monitor-linux run
+ExecStart=%h/.local/bin/roku-monitor run
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
@@ -24,7 +24,7 @@ RestartPreventExitStatus=78
 # The SIGTERM handler turns the TV off with a <=3s budget. At logout this
 # timeout applies; at system shutdown Ubuntu caps the whole user manager at 5s.
 TimeoutStopSec=10
-SyslogIdentifier=roku-monitor-linux
+SyslogIdentifier=roku-monitor
 
 [Install]
 WantedBy=graphical-session.target

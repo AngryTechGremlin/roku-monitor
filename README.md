@@ -1,4 +1,4 @@
-# roku-monitor-linux
+# roku-monitor
 
 You use a Roku TV as one of your PC's monitors. This makes the TV behave like
 one: **while the PC is putting a picture on its displays, the TV is on and on
@@ -6,21 +6,31 @@ your HDMI input; when the PC blanks its displays (idle, lock, suspend, logout,
 shutdown) the TV turns off; when they come back, the TV comes back on the
 right input.** No exceptions, no "smart" guessing.
 
-One Python file, no dependencies, runs as a `systemd --user` service. It talks
-to the TV over Roku's local HTTP control protocol (ECP, port 8060) and reads
-the PC side straight from the kernel (`/sys/class/drm`), so it works on any
-Linux desktop — GNOME, KDE, Sway, X11 — not just the one it was written on.
+One Python file, no dependencies, on **Linux and Windows**. It talks to the TV
+over Roku's local HTTP control protocol (ECP, port 8060), and on the PC side it
+asks the operating system itself whether it is putting out a picture — the
+kernel's DRM state on Linux, the console display state on Windows — rather than
+trusting a desktop environment's idea of "idle". So it works under GNOME, KDE,
+Sway and X11, and on Windows 10/11.
 
 ## Requirements
 
-**PC**
-- Linux with a KMS graphics driver (anything modern: amdgpu, i915, nouveau,
-  …). Tested on Ubuntu 26.04 / GNOME 50 (Wayland) / amdgpu.
+**PC — Linux**
+- A KMS graphics driver (anything modern: amdgpu, i915, nouveau, …). Tested on
+  Ubuntu 26.04 / GNOME 50 (Wayland) / amdgpu.
 - `python3` (3.10+). Optional but recommended: `python3-gi` (`sudo apt install
   python3-gi gir1.2-glib-2.0`) — stock on Ubuntu desktop — so the TV can be
   turned off *before* suspend/shutdown takes the network down. Without it the
   TV still follows your displays; it just may stay on across a suspend.
 - `systemd --user` (any systemd desktop distro).
+
+**PC — Windows**
+- Windows 10 or 11. Tested on Windows 11 Pro.
+- Python 3.10+ — `winget install -e --id Python.Python.3.12`. The
+  "python.exe" that ships in `WindowsApps` is only a Store shortcut; the
+  installer detects and rejects it.
+- Nothing else: the Windows backend is `ctypes` against the OS, and the daemon
+  runs from a per-user logon task, so no administrator rights are needed.
 
 **TV** — set these once, on the TV itself:
 - **Settings → System → Advanced system settings → Control by mobile apps →
@@ -45,28 +55,67 @@ Linux desktop — GNOME, KDE, Sway, X11 — not just the one it was written on.
 
 ## Install
 
+### Linux
+
 ```bash
-git clone https://github.com/AngryTechGremlin/roku-monitor-linux ~/roku-monitor-linux
-cd ~/roku-monitor-linux
+git clone https://github.com/AngryTechGremlin/roku-monitor ~/roku-monitor
+cd ~/roku-monitor
 ./install.sh
 ```
 
 The installer (no `sudo`) checks the prerequisites, symlinks the script to
-`~/.local/bin/roku-monitor-linux`, installs the user unit, creates
-`~/.config/roku-monitor-linux/env` from `.env.example`, runs a network
+`~/.local/bin/roku-monitor`, installs the user unit, creates
+`~/.config/roku-monitor/env` from `.env.example`, runs a network
 discovery so you can pick the TV (writing its IP, serial and MAC for you),
 asks which input the PC is on, and enables the service. Turn the TV on before
 running it — a Roku in deep sleep does not answer discovery.
 
-Then: `roku-monitor-linux status` (what the daemon sees), `journalctl --user
--u roku-monitor-linux -f` (what it does). `./uninstall.sh [--purge]` reverses
+### Windows
+
+```powershell
+winget install -e --id Python.Python.3.12   # if you do not have real Python yet
+# download or copy this repo, then from its folder:
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Same flow: it finds a real Python, creates `%APPDATA%\roku-monitor\env`, lets
+you pick the TV and input, then registers a **Scheduled Task** that starts the
+daemon with `pythonw.exe` (no console window) at every logon and restarts it if
+it ever dies. Logs go to `%LOCALAPPDATA%\roku-monitor\roku-monitor.log` —
+there is no journal to write to.
+
+The task must run in your interactive session: the daemon listens for
+display-power messages on a hidden window, which only exists once you are
+logged in. That is also why starting it over SSH does not work — the CLI
+commands (`status`, `on`, `off`) do.
+
+`.\uninstall.ps1 [-Purge]` reverses everything.
+
+### If discovery finds nothing
+
+Discovery uses multicast, and some networks (or access points) never deliver it
+to a particular device — a TV can be perfectly reachable and still stay
+invisible to a search. Point at it directly instead:
+
+```bash
+roku-monitor discover --ip <tv-ip>
+```
+
+That reads the TV and prints the exact `ROKU_TV_IP` / `ROKU_TV_SERIAL` /
+`ROKU_TV_MAC` lines to paste into your config. Both installers offer the same
+option. Note that on such a network Wake-on-LAN broadcasts will not reach the
+TV either, so **Fast TV start really is required** there.
+
+Then: `roku-monitor status` (what the daemon sees), `journalctl --user
+-u roku-monitor -f` (what it does). `./uninstall.sh [--purge]` reverses
 everything (`--purge` also deletes the config).
 
 ## Configuration
 
-`~/.config/roku-monitor-linux/env`, mode 0600, read by both the CLI and the
-service. Every key is documented in [`.env.example`](.env.example). The ones
-that matter:
+Linux: `~/.config/roku-monitor/env` (mode 0600). Windows:
+`%APPDATA%\roku-monitor\env`. Read by both the CLI and the service, so they
+never disagree. Every key is documented in [`.env.example`](.env.example). The
+ones that matter:
 
 | Key | Default | Why |
 |---|---|---|
@@ -74,7 +123,7 @@ that matter:
 | `ROKU_TV_SERIAL` | — | Safety: refuse to command a *different* Roku if DHCP hands the TV's old IP to another one (easy to have four Rokus in a house). |
 | `ROKU_TV_MAC` | — | Best-effort Wake-on-LAN if the TV went to deep sleep. Not a substitute for Fast TV start. |
 | `ROKU_INPUT` | `hdmi3` | Which TV input the PC is on (`hdmi1..4`, `av1`, `tuner`). |
-| `ROKU_CONNECTOR` | auto | The PC's output that feeds the TV. Found automatically from the TV's EDID (vendor `RKU`); override with e.g. `HDMI-A-1` if you must. |
+| `ROKU_CONNECTOR` | auto | *Linux only.* The PC's output that feeds the TV. Found automatically from the TV's EDID (vendor `RKU`); override with e.g. `HDMI-A-1` if you must. |
 | `ROKU_ONLY_OFF_WHEN_ON_INPUT` | `false` | Opt-in courtesy for a *shared* TV: don't turn it off if it is showing something other than the PC's input when the PC blanks. Off by default — the TV is your monitor. |
 | `ROKU_OFF_ON_SLEEP` / `ROKU_OFF_ON_STOP` | `true` | Turn the TV off before suspend / when the service stops (logout, `systemctl --user stop`). A `restart` is a stop+start, so expect a brief TV off/on blink; set `ROKU_OFF_ON_STOP=false` if that bothers you. |
 | `ROKU_OFF_DELAY_S` | `10` | Grace after the displays go dark; cancelled if they light up again. Absorbs "blank, then you touch the mouse". |
@@ -84,16 +133,24 @@ that matter:
 
 | Command | What it does |
 |---|---|
-| `roku-monitor-linux run` | The daemon (what the service runs). |
-| `roku-monitor-linux discover` | SSDP scan; lists Rokus with name, kind, serial, MAC, power state. |
-| `roku-monitor-linux status` | Every DRM connector with status/enabled/dpms, which one is the Roku, whether the PC is driving anything, and the TV's power mode + active input. |
-| `roku-monitor-linux on` | One-shot "TV on + input" (exit 1 if it could not). |
-| `roku-monitor-linux off [--force]` | One-shot TV off (`--force` ignores the shared-TV guard). |
+| `roku-monitor run` | The daemon (what the service runs). |
+| `roku-monitor discover` | SSDP scan; lists Rokus with name, kind, serial, MAC, power state. |
+| `roku-monitor discover --ip <tv-ip>` | Read one TV directly, for networks that block multicast. |
+| `roku-monitor status` | What the daemon sees: the display state, which monitor is the Roku, and the TV's power mode + active input. |
+| `roku-monitor on` | One-shot "TV on + input" (exit 1 if it could not). |
+| `roku-monitor off [--force]` | One-shot TV off (`--force` ignores the shared-TV guard). |
+
+On Windows, run these as `python roku_monitor.py <command>` from the repo
+folder (or add a shortcut of your own).
 
 ## How it works
 
-**The source of truth is the kernel, per output.** For each connector,
-`/sys/class/drm/<connector>/` exposes three files:
+Everything below the platform line is shared: the same debounce, the same
+"look before you command" reconciler, the same Roku ECP calls.
+
+### Linux: the kernel, per output
+
+For each connector, `/sys/class/drm/<connector>/` exposes three files:
 
 | file | meaning |
 |---|---|
@@ -138,6 +195,33 @@ sampling, standby stretches of up to 9 minutes) — so in the recommended
 configuration the layout stays put; the CEC tip under *Requirements* is the
 known mitigation if yours behaves differently.
 
+### Windows: the console display state
+
+Windows has no per-monitor power state — the console blanks as a whole — and no
+call that answers "are the displays on right now". What it has is a
+notification: register for `GUID_CONSOLE_DISPLAY_STATE` and the OS tells you
+whenever the console display turns **off (0)**, **on (1)** or **dimmed (2)**,
+starting with the current value the moment you register. That is the same
+question the DRM files answer on Linux, asked of the OS instead of the kernel,
+and it is deliberately *not* the per-session variant, which would follow a
+virtual RDP display rather than the panel your TV is plugged into. Dimmed
+counts as on — the GPU is still scanning out.
+
+The daemon owns a hidden top-level window to receive it (a message-only window
+would be tidier but does not receive broadcast messages like `WM_ENDSESSION`),
+and also registers for suspend/resume notifications, which Modern Standby
+machines otherwise never deliver. `status` additionally lists the active
+monitors via `QueryDisplayConfig` and flags the Roku by its EDID vendor — for
+your information only, never for the power decision.
+
+Timing note: locking Windows does **not** blank the screen immediately; the
+hidden "console lock display off timeout" (1 minute by default) does. If you
+want the TV to follow a lock faster, lower it:
+`powercfg /setacvalueindex SCHEME_CURRENT SUB_VIDEO VIDEOCONLOCK 15` then
+`powercfg /setactive SCHEME_CURRENT`.
+
+### Shared: desired state, not commands
+
 **Desired state, not commands.** An edge in "displays driven?" becomes a
 desired TV state (on or off) handed to one worker thread that owns all talk
 with the TV. The worker first *looks* (`/query/device-info`,
@@ -152,14 +236,21 @@ next edge; it never loops at a TV that will not answer, and it never
 re-asserts on a schedule (if you turn the TV off by hand while the PC is
 awake, it stays off until the displays change state).
 
-**Suspend and shutdown.** With `python3-gi` the daemon holds a login1 *delay*
-inhibitor and turns the TV off the moment `PrepareForSleep` /
+**Suspend and shutdown.** On Linux, with `python3-gi`, the daemon holds a
+login1 *delay* inhibitor and turns the TV off the moment `PrepareForSleep` /
 `PrepareForShutdown` fires — before NetworkManager takes the Wi-Fi down — then
 releases the lock so the machine can sleep. On resume the displays light up
 and the normal "driven" edge turns the TV back on (the retry ladder covers
 the seconds until Wi-Fi is back). Logout stops the service (`PartOf=
 graphical-session.target`), which turns the TV off; the next login turns it
 on. Reboot is treated like shutdown: the TV goes off and comes back at login.
+
+Windows is the same shape with a tighter budget: `PBT_APMSUSPEND` and
+`WM_ENDSESSION` (shutdown *and* sign-out) trigger the same immediate off, but
+Windows allows only about two seconds and offers no way to hold the system
+back, so the off is a single fast request with no verification. If it loses
+that race — the Wi-Fi went down first — the TV simply stays on and is
+corrected the next time the displays come back.
 
 ## Troubleshooting
 
@@ -170,7 +261,7 @@ on. Reboot is treated like shutdown: the TV goes off and comes back at login.
   `ROKU_WOL_BROADCAST=192.168.x.255` helps on hosts with many interfaces.
 - **`HTTP 403`** in the log → *Control by mobile apps → Network access* is
   *Limited*. Set it to *Default*.
-- **TV turns on but lands on the wrong input** → `roku-monitor-linux status`
+- **TV turns on but lands on the wrong input** → `roku-monitor status`
   shows what the TV reports; `curl http://<tv-ip>:8060/query/apps` lists the
   `tvinput.*` ids your model uses; match `ROKU_INPUT`.
 - **"device at … has serial …, expected …"** → DHCP moved the TV. Run
@@ -178,19 +269,34 @@ on. Reboot is treated like shutdown: the TV goes off and comes back at login.
 - **TV blinks off/on when I restart the service** → expected (stop turns it
   off, start turns it on). `ROKU_OFF_ON_STOP=false` if you prefer.
 - **Service is inactive after login** → `systemctl --user status
-  roku-monitor-linux`. Exit code 78 means the config is missing or still has
+  roku-monitor`. Exit code 78 means the config is missing or still has
   placeholders. Did you run `install.sh` from inside a desktop session?
-- **Windows jumped to my other monitor** → the TV dropped hot-plug while off;
-  see *How it works* and the CEC tip.
-- **Roku connector "not found"** → the TV is off or on another input (its EDID
-  is not readable then) — normal; it is cached once seen. If it is never
-  found, set `ROKU_CONNECTOR`.
+- **My windows jumped to the other monitor** → the TV dropped hot-plug while
+  off; see *How it works* and the CEC tip.
+- **Roku connector "not found"** (Linux) → the TV is off or on another input
+  (its EDID is not readable then) — normal; it is cached once seen. If it is
+  never found, set `ROKU_CONNECTOR`.
+- **Nothing happens on Windows** → check the log first
+  (`%LOCALAPPDATA%\roku-monitor\roku-monitor.log`) and
+  `Get-ScheduledTaskInfo -TaskName roku-monitor`. The daemon only sees display
+  events inside your interactive session, so a copy started over SSH or in
+  session 0 will never react. Remember the lock-screen delay above.
+- **The TV can be pinged from one PC but not another** → some access points
+  stop delivering broadcast frames to a device, which breaks ARP (and so all
+  traffic) from machines that have not already learned its address, plus
+  discovery and Wake-on-LAN. Symptom: `Test-Connection` says
+  `DestinationHostUnreachable` and `Get-NetNeighbor` shows `Incomplete`, while
+  another machine talks to the TV fine. Rejoining the TV's Wi-Fi usually fixes
+  it; a persistent neighbor entry works around it:
+  `netsh interface ipv4 add neighbors "Wi-Fi" <tv-ip> <tv-mac-with-dashes> store=persistent`
+  (pair it with a DHCP reservation, or it goes stale).
 
 Handy checks:
 
 ```bash
+# Linux
 for c in /sys/class/drm/card*-*; do [ -e $c/status ] && echo "$(basename $c) $(cat $c/status)/$(cat $c/enabled)/$(cat $c/dpms)"; done
-journalctl --user -u roku-monitor-linux -f
+journalctl --user -u roku-monitor -f
 systemd-inhibit --list                     # shows the daemon's delay lock
 curl -s http://<tv-ip>:8060/query/active-app
 curl -s -X POST http://<tv-ip>:8060/keypress/PowerOff
@@ -201,17 +307,28 @@ busctl --user set-property org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/Disp
 # (pair the two: moving the mouse does not undo a forced blank on GNOME)
 ```
 
+```powershell
+# Windows
+Get-Content "$env:LOCALAPPDATA\roku-monitor\roku-monitor.log" -Tail 20 -Wait
+Get-ScheduledTaskInfo -TaskName roku-monitor
+python roku_monitor.py status
+Invoke-WebRequest "http://<tv-ip>:8060/query/active-app" -UseBasicParsing | Select-Object -Expand Content
+powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOCONLOCK   # lock-to-blank delay
+```
+
 ## Development
 
-`python3 -m unittest discover -s tests -v` (no TV, no desktop, no `gi`
-needed). CI runs that plus `py_compile`, `--help`, and shellcheck on every
-push. Conventional Commits. Never commit LAN addresses, serials or MACs —
-tests use `192.0.2.x` documentation addresses, docs use `<tv-ip>`.
+`python3 -m unittest discover -s tests -v` — no TV, no desktop, no `gi`, and
+the Windows decision logic is covered on Linux too (its ctypes layer is a thin
+forwarder around a pure function). CI runs the suite on Ubuntu *and* Windows
+runners, plus `py_compile`, `--help`, shellcheck and a PowerShell parse check.
+Conventional Commits. Never commit LAN addresses, serials or MACs — tests use
+`192.0.2.x` documentation addresses, docs use `<tv-ip>`.
 
-Ideas not built yet: a GNOME-only tweak to ignore the 15-second screen
-wake GNOME does for notifications while locked; turning the TV off when only
-*its* output is disabled in display settings; re-discovering the TV by serial
-when its IP moves.
+Ideas not built yet: a GNOME-only tweak to ignore the 15-second screen wake
+GNOME does for notifications while locked; turning the TV off when only *its*
+output is disabled in display settings; re-discovering the TV by serial when
+its IP moves.
 
 ## License
 

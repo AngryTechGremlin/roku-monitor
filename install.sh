@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install roku-monitor-linux as a systemd --user service for the current user.
+# Install roku-monitor as a systemd --user service for the current user.
 #   ./install.sh [--copy] [--no-discover] [--no-enable]
 # --copy        copy the script into ~/.local/bin instead of symlinking the clone
 # --no-discover skip the interactive "which TV?" step
@@ -7,7 +7,7 @@
 # No sudo is used anywhere; everything lands under $HOME.
 set -euo pipefail
 
-APP=roku-monitor-linux
+APP=roku-monitor
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 BIN_DIR=${XDG_BIN_HOME:-$HOME/.local/bin}
 CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/$APP
@@ -68,6 +68,34 @@ set_conf() { # key value  (keys are fixed names from .env.example, so sed on ^KE
   case "$2" in *[\|\&\\]*|*$'\n'*) die "refusing to write $1: value contains | & \\ or a newline" ;; esac
   if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=.*|$1=$2|" "$CONF"; else printf '%s=%s\n' "$1" "$2" >>"$CONF"; fi
 }
+ask_input() { # prompt for the HDMI input and store it
+  while :; do
+    printf 'Which input is the PC on? [hdmi1/hdmi2/hdmi3/hdmi4/av1/tuner] (hdmi3) '
+    read -r inp
+    inp=${inp:-hdmi3}; inp=${inp,,}; inp=${inp// /}   # 'HDMI 3' -> hdmi3
+    [[ "$inp" =~ ^[1-4]$ ]] && inp=hdmi$inp            # '3' -> hdmi3
+    case "$inp" in hdmi[1-4]|av1|tuner) break ;; *) warn "'$inp' is not one of hdmi1..4/av1/tuner" ;; esac
+  done
+  set_conf ROKU_INPUT "$inp"
+}
+
+by_ip() { # ask for an address and read the TV directly; returns 1 if nothing answered
+  printf "TV's IP address (or blank to skip): "
+  read -r manual
+  [ -n "$manual" ] || return 1
+  out=$(/usr/bin/python3 "$REPO_DIR/roku_monitor.py" discover --ip "$manual") || { echo "$out"; return 1; }
+  echo "$out"
+  ip=$(sed -n 's/^ *ROKU_TV_IP=//p' <<<"$out")
+  serial=$(sed -n 's/^ *ROKU_TV_SERIAL=//p' <<<"$out")
+  mac=$(sed -n 's/^ *ROKU_TV_MAC=//p' <<<"$out")
+  [ -n "$ip" ] || return 1
+  set_conf ROKU_TV_IP "$ip"
+  [[ "$serial" =~ ^[A-Za-z0-9]{6,}$ ]] && set_conf ROKU_TV_SERIAL "$serial"
+  [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] && set_conf ROKU_TV_MAC "$mac"
+  ask_input
+  say "wrote ROKU_TV_IP=$ip ROKU_INPUT=$inp to $CONF"
+}
+
 if [ "$DISCOVER" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
   say "Looking for Roku TVs on your network (turn the TV on first)..."
   tmp=$(mktemp)
@@ -76,7 +104,7 @@ if [ "$DISCOVER" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
   mapfile -t rows < <(grep -E '^ *[0-9]+ +[0-9.]+ ' "$tmp" | grep -v '(no ECP answer' || true)
   rm -f "$tmp"
   if [ "${#rows[@]}" -gt 0 ]; then
-    printf 'Which one is the TV you use as a monitor? [1-%d, or s to skip] ' "${#rows[@]}"
+    printf 'Which one is the TV you use as a monitor? [1-%d, i to type an IP, or s to skip] ' "${#rows[@]}"
     read -r pick
     if [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#rows[@]}" ]; then
       row=${rows[$((pick-1))]}
@@ -87,20 +115,18 @@ if [ "$DISCOVER" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
       set_conf ROKU_TV_IP "$ip"
       [[ "$serial" =~ ^[A-Za-z0-9]{6,}$ ]] && set_conf ROKU_TV_SERIAL "$serial"
       [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] && set_conf ROKU_TV_MAC "$mac"
-      while :; do
-        printf 'Which input is the PC on? [hdmi1/hdmi2/hdmi3/hdmi4/av1/tuner] (hdmi3) '
-        read -r inp
-        inp=${inp:-hdmi3}; inp=${inp,,}; inp=${inp// /}   # 'HDMI 3' -> hdmi3
-        [[ "$inp" =~ ^[1-4]$ ]] && inp=hdmi$inp            # '3' -> hdmi3
-        case "$inp" in hdmi[1-4]|av1|tuner) break ;; *) warn "'$inp' is not one of hdmi1..4/av1/tuner" ;; esac
-      done
-      set_conf ROKU_INPUT "$inp"
+      ask_input
       say "wrote ROKU_TV_IP=$ip ROKU_INPUT=$inp to $CONF"
+    elif [ "$pick" = i ] || [ "$pick" = I ]; then
+      by_ip || say "skipped; edit $CONF by hand (ROKU_TV_IP is required)"
     else
       say "skipped; edit $CONF by hand (ROKU_TV_IP is required)"
     fi
   else
-    warn "no Roku answered; turn the TV on and run: $APP discover  — then edit $CONF"
+    # Discovery is multicast; some networks never deliver it to a given TV,
+    # so offer the address directly rather than sending people to a text editor.
+    warn "no Roku answered the search (some networks block multicast)."
+    by_ip || warn "edit $CONF by hand: ROKU_TV_IP is required"
   fi
 fi
 

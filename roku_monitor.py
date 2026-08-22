@@ -1,17 +1,24 @@
 #!/usr/bin/python3
-"""roku-monitor-linux: make a Roku TV mirror what this PC's GPU is driving.
+"""roku-monitor: make a Roku TV mirror what this PC's GPU is driving.
 
 One rule, no exceptions: while the PC is putting a picture on its displays the
 TV is one of those displays (on, and on the configured HDMI input); when the
 PC stops driving its displays (idle blank, lock, suspend, logout, shutdown)
 the TV is turned off.
 
-Source of truth is the kernel, not the desktop: /sys/class/drm/<connector>/
-{status,enabled,dpms} say whether the GPU is actually scanning out on each
-output. That works on any Linux compositor (GNOME, KDE, Sway, X11) and needs
-no D-Bus. The only optional desktop-ish dependency is python3-gi, used to hear
-login1's PrepareForSleep/PrepareForShutdown so the TV goes off *before* the
-network does. See README.md for the why behind each choice.
+The source of truth is the OS's own answer to "am I scanning out a picture",
+never a desktop environment's intent:
+
+  Linux   /sys/class/drm/<connector>/{status,enabled,dpms} — per output, from
+          the kernel; works under any compositor (GNOME, KDE, Sway, X11).
+          python3-gi is optional and only used to hear login1's
+          PrepareForSleep/PrepareForShutdown so the TV goes off *before* the
+          network does.
+  Windows GUID_CONSOLE_DISPLAY_STATE power-setting notifications — the
+          console (physical) display state, delivered to a hidden window,
+          plus the suspend/session-end messages. ctypes only, no pip deps.
+
+See README.md for the why behind each choice.
 
 Subcommands: run | discover | status | on | off
 """
@@ -21,6 +28,7 @@ import glob
 import http.client
 import ipaddress
 import logging
+import logging.handlers
 import os
 import re
 import signal
@@ -33,11 +41,15 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-APP = "roku-monitor-linux"
+APP = "roku-monitor"
 ECP_PORT = 8060
 EX_CONFIG = 78  # sysexits.h: a config problem a restart cannot fix
 SYS_DRM = "/sys/class/drm"
 ON, OFF = "ON", "OFF"
+IS_WIN = sys.platform == "win32"
+# How long the pre-suspend/stop off may take. Windows allows only ~2 s at
+# PBT_APMSUSPEND and offers no delay-inhibitor equivalent to logind's.
+URGENT_OFF_BUDGET = 1.8 if IS_WIN else 3.0
 
 log = logging.getLogger(APP)
 
@@ -101,8 +113,17 @@ def parse_env_file(text):
 
 
 def default_config_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    if IS_WIN:
+        base = os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     return os.path.join(base, APP, "env")
+
+
+def default_log_path():
+    """Windows has no journal, so `run` also writes a rotating file here."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    return os.path.join(base, APP, APP + ".log")
 
 
 def config_candidates(explicit=None):
@@ -171,7 +192,7 @@ class Config:
             if explicit:
                 raise ConfigError(f"config file not found: {path}")
         # Process environment always wins (that is how a systemd drop-in or a
-        # one-off `ROKU_TV_IP=... roku-monitor-linux status` overrides things).
+        # one-off `ROKU_TV_IP=... roku-monitor status` overrides things).
         for k in DEFAULTS:
             if k in os.environ:
                 values[k] = os.environ[k]
@@ -180,7 +201,7 @@ class Config:
     def require_tv(self):
         if not self.tv_ip:
             raise ConfigError(
-                "ROKU_TV_IP is not set. Run `roku-monitor-linux discover` and put the "
+                "ROKU_TV_IP is not set. Run `roku-monitor discover` and put the "
                 f"TV's IP (and serial/MAC) in {default_config_path()}")
 
 
@@ -296,6 +317,345 @@ class DisplaySampler:
             else:
                 roku = "driven" if match[0].driven else "idle"
         return Sample(pc_on, roku, self.roku_name, connectors)
+
+
+# ---------------------------------------------------------------------------
+# Windows: the console display state is the OS's own "am I lighting the
+# monitors" answer. There is no per-output power state on Windows (the console
+# blanks as a whole) and no API to read it on demand — you register for
+# notifications and the current value arrives immediately. Everything here is
+# ctypes; nothing in this section is imported or touched on Linux.
+# ---------------------------------------------------------------------------
+
+# MONITOR_DISPLAY_STATE values carried by GUID_CONSOLE_DISPLAY_STATE.
+DISPLAY_OFF, DISPLAY_ON, DISPLAY_DIMMED = 0, 1, 2
+
+# Event kinds handed to handle_win_event(). Keeping them as plain strings lets
+# the decision logic be tested on any platform.
+EV_DISPLAY = "display"      # value: MONITOR_DISPLAY_STATE
+EV_SUSPEND = "suspend"
+EV_RESUME = "resume"
+EV_ENDSESSION = "endsession"  # value: True if logging off rather than shutting down
+EV_CLOSE = "close"
+
+
+def pnp_vendor(code):
+    """Decode an EDID/PNP manufacturer id (3 x 5-bit letters) to e.g. 'RKU'.
+
+    Windows' DISPLAYCONFIG edidManufactureId holds the same 16 bits as the
+    EDID, but byte-swapped on little-endian, so callers try both orders.
+    """
+    return "".join(chr(64 + ((code >> s) & 0x1F)) for s in (10, 5, 0))
+
+
+def is_roku_target(edid_code, friendly_name):
+    if "roku" in (friendly_name or "").lower():
+        return True
+    swapped = ((edid_code & 0xFF) << 8) | (edid_code >> 8)
+    return "RKU" in (pnp_vendor(edid_code), pnp_vendor(swapped))
+
+
+def handle_win_event(daemon, kind, value=None):
+    """Pure decision logic for the Windows event loop (no ctypes, testable).
+
+    Mirrors the login1 handlers on Linux: the display state drives the normal
+    debounce path, while suspend/session-end take the urgent off path.
+    """
+    cfg = daemon.cfg
+    if kind == EV_DISPLAY:
+        on = value != DISPLAY_OFF  # dimmed still means the GPU is scanning out
+        daemon.sampler.set_display_on(on)
+        if not daemon.sleeping:
+            daemon.tick()
+        return True
+    if kind == EV_SUSPEND:
+        daemon.sleeping = True
+        log.info("system is going to sleep")
+        if cfg.off_on_sleep:
+            daemon._urgent_off("suspend")
+        else:
+            log.info("ROKU_OFF_ON_SLEEP=false — leaving the TV on")
+        return True
+    if kind == EV_RESUME:
+        log.info("system resumed")
+        daemon.sleeping = False
+        daemon.off_samples = 0
+        daemon.off_deadline = None
+        return True
+    if kind == EV_ENDSESSION:
+        daemon.shutdown_seen = True
+        daemon.sleeping = True
+        log.info("session ending (%s)", "sign-out" if value else "shutdown")
+        if cfg.off_on_stop:
+            daemon._urgent_off("sign-out" if value else "shutdown")
+        return True
+    if kind == EV_CLOSE:
+        daemon.on_term()
+        return True
+    return False
+
+
+class WindowsDisplaySampler:
+    """Same Sample shape as DisplaySampler so Daemon._tick is unchanged.
+
+    pc_on comes from the console display state pushed in by the event loop.
+    The monitor list is cosmetic (status/logging only) and is allowed to fail:
+    an SSH session has no interactive desktop to query.
+    """
+
+    def __init__(self, override=""):
+        self.override = override
+        self.roku_name = None
+        # Nothing can tell us the state before the first notification, but
+        # registration delivers the current value within milliseconds, and a
+        # daemon starting at logon is starting on a lit screen.
+        self.display_on = True
+
+    def set_display_on(self, on):
+        if on != self.display_on:
+            log.info("console display is now %s", "on" if on else "off")
+        self.display_on = on
+
+    def sample(self):
+        connectors = []
+        roku = "unknown"
+        try:
+            connectors = list_windows_targets()
+        except Exception as e:  # no desktop (session 0), or an API that failed
+            log.debug("display topology unavailable: %s", e)
+        for c in connectors:
+            if self.roku_name is None and c.is_roku:
+                self.roku_name = c.name
+            if c.name == self.roku_name:
+                roku = "driven" if self.display_on else "idle"
+        if self.roku_name and roku == "unknown" and connectors:
+            roku = "absent"  # it was in the topology before and is not now
+        return Sample(self.display_on, roku, self.roku_name, connectors)
+
+
+class WinTarget:
+    """One active display path, printed by `status`."""
+    __slots__ = ("name", "is_roku")
+
+    def __init__(self, name, is_roku):
+        self.name, self.is_roku = name, is_roku
+
+    def __repr__(self):
+        return f"{self.name}{' (Roku)' if self.is_roku else ''}"
+
+
+def list_windows_targets():
+    """Active display targets via QueryDisplayConfig. Raises on failure."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    QDC_ONLY_ACTIVE_PATHS = 0x00000002
+    ERROR_INSUFFICIENT_BUFFER = 122
+    DEVICE_INFO_GET_TARGET_NAME = 2
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+    class PATH_SOURCE_INFO(ctypes.Structure):
+        _fields_ = [("adapterId", LUID), ("id", wintypes.UINT),
+                    ("modeInfoIdx", wintypes.UINT), ("statusFlags", wintypes.UINT)]
+
+    class PATH_TARGET_INFO(ctypes.Structure):
+        _fields_ = [("adapterId", LUID), ("id", wintypes.UINT), ("modeInfoIdx", wintypes.UINT),
+                    ("outputTechnology", wintypes.UINT), ("rotation", wintypes.UINT),
+                    ("scaling", wintypes.UINT), ("refreshNumerator", wintypes.UINT),
+                    ("refreshDenominator", wintypes.UINT), ("scanLineOrdering", wintypes.UINT),
+                    ("targetAvailable", wintypes.BOOL), ("statusFlags", wintypes.UINT)]
+
+    class PATH_INFO(ctypes.Structure):
+        _fields_ = [("sourceInfo", PATH_SOURCE_INFO), ("targetInfo", PATH_TARGET_INFO),
+                    ("flags", wintypes.UINT)]
+
+    class MODE_INFO(ctypes.Structure):  # opaque here; only its size matters
+        _fields_ = [("infoType", wintypes.UINT), ("id", wintypes.UINT),
+                    ("adapterId", LUID), ("blob", ctypes.c_byte * 48)]
+
+    class DEVICE_INFO_HEADER(ctypes.Structure):
+        _fields_ = [("type", wintypes.UINT), ("size", wintypes.UINT),
+                    ("adapterId", LUID), ("id", wintypes.UINT)]
+
+    class TARGET_DEVICE_NAME(ctypes.Structure):
+        _fields_ = [("header", DEVICE_INFO_HEADER), ("flags", wintypes.UINT),
+                    ("outputTechnology", wintypes.UINT),
+                    ("edidManufactureId", wintypes.USHORT),
+                    ("edidProductCodeId", wintypes.USHORT),
+                    ("connectorInstance", wintypes.UINT),
+                    ("monitorFriendlyDeviceName", wintypes.WCHAR * 64),
+                    ("monitorDevicePath", wintypes.WCHAR * 128)]
+
+    for _ in range(3):  # the topology can change between sizing and reading
+        n_paths, n_modes = wintypes.UINT(), wintypes.UINT()
+        rc = user32.GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,
+                                                ctypes.byref(n_paths), ctypes.byref(n_modes))
+        if rc:
+            raise OSError(f"GetDisplayConfigBufferSizes failed: {rc}")
+        paths = (PATH_INFO * n_paths.value)()
+        modes = (MODE_INFO * n_modes.value)()
+        rc = user32.QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                                       ctypes.byref(n_paths), paths,
+                                       ctypes.byref(n_modes), modes, None)
+        if rc == ERROR_INSUFFICIENT_BUFFER:
+            continue
+        if rc:
+            raise OSError(f"QueryDisplayConfig failed: {rc}")
+        out = []
+        for i in range(n_paths.value):
+            info = TARGET_DEVICE_NAME()
+            info.header.type = DEVICE_INFO_GET_TARGET_NAME
+            info.header.size = ctypes.sizeof(TARGET_DEVICE_NAME)
+            info.header.adapterId = paths[i].targetInfo.adapterId
+            info.header.id = paths[i].targetInfo.id
+            if user32.DisplayConfigGetDeviceInfo(ctypes.byref(info)):
+                continue
+            name = info.monitorFriendlyDeviceName or f"target {info.header.id}"
+            out.append(WinTarget(name, is_roku_target(info.edidManufactureId, name)))
+        return out
+    raise OSError("QueryDisplayConfig kept resizing")
+
+
+def run_windows_loop(daemon):
+    """Hidden-window message pump: display state, suspend/resume, session end.
+
+    A message-only window would be simpler but does not receive broadcast
+    messages (WM_ENDSESSION, PBT_APMSUSPEND), so this creates a normal
+    top-level window and never shows it.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    WM_DESTROY, WM_CLOSE, WM_TIMER = 0x0002, 0x0010, 0x0113
+    WM_QUERYENDSESSION, WM_ENDSESSION = 0x0011, 0x0016
+    WM_POWERBROADCAST = 0x0218
+    PBT_APMSUSPEND, PBT_APMRESUMEAUTOMATIC = 0x0004, 0x0012
+    PBT_POWERSETTINGCHANGE = 0x8013
+    ENDSESSION_LOGOFF = 0x80000000
+    DEVICE_NOTIFY_WINDOW_HANDLE = 0
+    ERROR_ALREADY_EXISTS = 183
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)]
+
+    # {6FE69556-704A-47A0-8F24-C28D936FDA47}
+    GUID_CONSOLE_DISPLAY_STATE = GUID(0x6FE69556, 0x704A, 0x47A0,
+                                      (ctypes.c_ubyte * 8)(0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47))
+
+    class POWERBROADCAST_SETTING(ctypes.Structure):
+        _fields_ = [("PowerSetting", GUID), ("DataLength", wintypes.DWORD),
+                    ("Data", ctypes.c_ubyte * 4)]
+
+    # Only one daemon per user: systemd gave us this for free on Linux.
+    mutex = kernel32.CreateMutexW(None, False, "Local\\" + APP)
+    if mutex and ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        log.info("another %s is already running — exiting", APP)
+        return 0
+
+    LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                 ctypes.c_size_t, ctypes.c_ssize_t)
+
+    def on_message(hwnd, msg, wparam, lparam):
+        if msg == WM_TIMER:
+            daemon.tick()
+            return 0
+        if msg == WM_POWERBROADCAST:
+            if wparam == PBT_POWERSETTINGCHANGE:
+                setting = ctypes.cast(lparam, ctypes.POINTER(POWERBROADCAST_SETTING)).contents
+                if bytes(setting.PowerSetting) == bytes(GUID_CONSOLE_DISPLAY_STATE):
+                    handle_win_event(daemon, EV_DISPLAY, setting.Data[0])
+            elif wparam == PBT_APMSUSPEND:
+                handle_win_event(daemon, EV_SUSPEND)
+            elif wparam == PBT_APMRESUMEAUTOMATIC:
+                handle_win_event(daemon, EV_RESUME)
+            return 1
+        if msg == WM_QUERYENDSESSION:
+            return 1  # never block the shutdown; do the work in WM_ENDSESSION
+        if msg == WM_ENDSESSION:
+            if wparam:
+                # The session can end as soon as we return, so this must be
+                # synchronous. The block reason explains any brief delay.
+                user32.ShutdownBlockReasonCreate(hwnd, "Turning the Roku TV off")
+                try:
+                    handle_win_event(daemon, EV_ENDSESSION, bool(lparam & ENDSESSION_LOGOFF))
+                finally:
+                    user32.ShutdownBlockReasonDestroy(hwnd)
+            return 0
+        if msg == WM_CLOSE:
+            handle_win_event(daemon, EV_CLOSE)
+            user32.DestroyWindow(hwnd)
+            return 0
+        if msg == WM_DESTROY:
+            user32.PostQuitMessage(0)
+            return 0
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def safe_proc(hwnd, msg, wparam, lparam):
+        try:
+            return on_message(hwnd, msg, wparam, lparam)
+        except Exception:  # a raising WndProc would take the process down
+            log.exception("window message %s failed", msg)
+            return 0
+
+    class WNDCLASS(ctypes.Structure):
+        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                    ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                    ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+    proc = WNDPROC(safe_proc)          # must outlive the window: keep a reference
+    run_windows_loop._proc = proc
+    wc = WNDCLASS()
+    wc.lpfnWndProc = proc
+    wc.hInstance = kernel32.GetModuleHandleW(None)
+    wc.lpszClassName = APP + "-window"
+    if not user32.RegisterClassW(ctypes.byref(wc)):
+        raise OSError(f"RegisterClassW failed: {ctypes.get_last_error()}")
+
+    user32.CreateWindowExW.restype = wintypes.HWND
+    hwnd = user32.CreateWindowExW(0, wc.lpszClassName, APP, 0x00CF0000,
+                                  0, 0, 0, 0, None, None, wc.hInstance, None)
+    if not hwnd:
+        raise OSError(f"CreateWindowExW failed: {ctypes.get_last_error()}")
+
+    if not user32.RegisterPowerSettingNotification(
+            wintypes.HANDLE(hwnd), ctypes.byref(GUID_CONSOLE_DISPLAY_STATE),
+            DEVICE_NOTIFY_WINDOW_HANDLE):
+        log.warning("RegisterPowerSettingNotification failed (%s): display changes "
+                    "will not be seen", ctypes.get_last_error())
+    # Without this, Modern Standby machines never deliver suspend/resume.
+    try:
+        user32.RegisterSuspendResumeNotification(wintypes.HANDLE(hwnd), DEVICE_NOTIFY_WINDOW_HANDLE)
+    except AttributeError:
+        log.debug("RegisterSuspendResumeNotification unavailable")
+    user32.SetTimer(hwnd, 1, int(daemon.cfg.poll_s * 1000), None)
+    log.info("watching the console display state (hidden window)")
+
+    def on_ctrl(_type):
+        daemon.on_int()
+        user32.PostMessageW(hwnd, WM_DESTROY, 0, 0)
+        return True
+
+    HANDLER = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)(on_ctrl)
+    run_windows_loop._ctrl = HANDLER
+    kernel32.SetConsoleCtrlHandler(HANDLER, True)
+
+    msg = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+        if daemon.stop_event.is_set():
+            break
+    return daemon.exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -814,8 +1174,8 @@ class Daemon:
         self.off_deadline = None
         self.committed = OFF
         self.reconciler.request(OFF, urgent=True)
-        if not self.reconciler.wait_done(3.0):
-            log.info("%s: TV off still in flight after 3s, continuing", why)
+        if not self.reconciler.wait_done(URGENT_OFF_BUDGET):
+            log.info("%s: TV off still in flight after %.1fs, continuing", why, URGENT_OFF_BUDGET)
 
     def on_term(self):
         if not self.stop_event.is_set():
@@ -902,6 +1262,8 @@ class Daemon:
     def run(self):
         self.reconciler.start()
         self._initial()
+        if IS_WIN:
+            return run_windows_loop(self)
         try:
             import gi  # noqa: F401
             gi.require_version("Gio", "2.0")
@@ -950,16 +1312,56 @@ class Daemon:
 # CLI
 # ---------------------------------------------------------------------------
 
-def _setup_logging(level):
-    logging.basicConfig(stream=sys.stderr, format="%(levelname)s %(message)s",
+def _setup_logging(level, to_file=False):
+    handlers = []
+    # Under pythonw.exe (how the Windows service runs) sys.stderr is None.
+    if sys.stderr is not None:
+        handlers.append(logging.StreamHandler(sys.stderr))
+    if to_file:
+        try:
+            path = default_log_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            handlers.append(logging.handlers.RotatingFileHandler(
+                path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"))
+        except OSError as e:
+            if handlers:
+                print(f"cannot open log file: {e}", file=sys.stderr)
+    logging.basicConfig(handlers=handlers or [logging.NullHandler()],
+                        format="%(asctime)s %(levelname)s %(message)s" if to_file else "%(levelname)s %(message)s",
                         level=getattr(logging, level, logging.INFO))
 
 
+def describe_tv(ip, timeout=5.0):
+    """One row of `discover` output for a known IP, or None if it isn't a Roku."""
+    try:
+        info = Roku(ip, timeout=timeout).device_info()
+    except EcpError:
+        return None
+    name = info.get("user-device-name") or info.get("friendly-device-name") or "?"
+    kind = "TV" if info.get("is-tv") == "true" else info.get("model-name", "player")
+    return (ip, name, kind, info.get("serial-number", ""),
+            info.get("wifi-mac") or info.get("ethernet-mac") or "", info.get("power-mode", ""))
+
+
 def cmd_discover(args, cfg):
+    ip = getattr(args, "ip", None)
+    if ip:
+        # Discovery is multicast, which some networks (and some access points)
+        # never deliver to a given device. Naming the IP always works.
+        row = describe_tv(ip)
+        if not row:
+            print(f"No Roku answered at {ip}. Check the IP, and that Settings > System > "
+                  "Advanced system settings > Control by mobile apps is enabled.")
+            return 1
+        print(f"\n  {row[1]} ({row[2]}, {row[5]})")
+        print(f"  ROKU_TV_IP={row[0]}\n  ROKU_TV_SERIAL={row[3]}\n  ROKU_TV_MAC={row[4]}")
+        return 0
     print("Searching for Rokus (SSDP, ~4s)... TVs in deep sleep do not answer; turn the TV on first.")
     ips = ssdp_discover()
     if not ips:
-        print("No Roku answered. Is the TV on and on the same network?")
+        print("No Roku answered. Is the TV on and on the same network?\n"
+              "Some networks do not deliver multicast to every device — if you know the TV's\n"
+              f"address, use: {APP} discover --ip <tv-ip>")
         return 1
     rows = []
     for ip in ips:
@@ -984,15 +1386,30 @@ def cmd_discover(args, cfg):
     return 0
 
 
+def make_sampler(cfg):
+    return WindowsDisplaySampler(cfg.connector) if IS_WIN else DisplaySampler(override=cfg.connector)
+
+
 def cmd_status(args, cfg):
-    sampler = DisplaySampler(override=cfg.connector)
-    s = sampler.sample()
+    s = make_sampler(cfg).sample()
     print(f"config: {cfg.source or '(defaults + environment)'}")
-    print(f"PC displays driven: {'YES' if s.pc_on else 'no'}")
-    for c in s.connectors:
-        tag = "  <- Roku" if c.name == s.roku_name else ""
-        print(f"  {c.name:<18} {c.status:<13} {c.enabled:<9} {c.dpms:<4} {'driven' if c.driven else ''}{tag}")
-    print(f"Roku connector: {s.roku_name or 'not found (set ROKU_CONNECTOR)'} -> {s.roku}")
+    if IS_WIN:
+        # Windows has no per-output power state and the daemon learns the
+        # console state from notifications, so a one-shot CLI run cannot know
+        # it (and an SSH session has no desktop to query at all).
+        print("Displays: live state is only known inside the running daemon "
+              "(see the log); this listing is the active monitor topology.")
+        for c in s.connectors:
+            print(f"  {c!r}")
+        if not s.connectors:
+            print("  (no topology available — running without an interactive desktop?)")
+        print(f"Roku monitor: {s.roku_name or 'not identified'}")
+    else:
+        print(f"PC displays driven: {'YES' if s.pc_on else 'no'}")
+        for c in s.connectors:
+            tag = "  <- Roku" if c.name == s.roku_name else ""
+            print(f"  {c.name:<18} {c.status:<13} {c.enabled:<9} {c.dpms:<4} {'driven' if c.driven else ''}{tag}")
+        print(f"Roku connector: {s.roku_name or 'not found (set ROKU_CONNECTOR)'} -> {s.roku}")
     if not cfg.tv_ip:
         print("TV: ROKU_TV_IP not set")
         return 1
@@ -1028,8 +1445,7 @@ def cmd_off(args, cfg):
 def cmd_run(args, cfg):
     cfg.require_tv()
     roku = Roku(cfg.tv_ip, cfg.ecp_timeout, cfg.serial)
-    sampler = DisplaySampler(override=cfg.connector)
-    daemon = Daemon(cfg, sampler, Reconciler(roku, cfg))
+    daemon = Daemon(cfg, make_sampler(cfg), Reconciler(roku, cfg))
     return daemon.run()
 
 
@@ -1039,8 +1455,10 @@ def main(argv=None):
     p.add_argument("--config", help=f"env file (default: {default_config_path()} or ./.env)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="follow the displays (what the systemd service runs)")
-    sub.add_parser("discover", help="list Rokus on the LAN with IP/serial/MAC")
+    sub.add_parser("run", help="follow the displays (what the service runs)")
+    disc = sub.add_parser("discover", help="list Rokus on the LAN with IP/serial/MAC")
+    disc.add_argument("--ip", help="skip the search and read this address directly "
+                                   "(for networks that do not deliver multicast)")
     sub.add_parser("status", help="show connector state, TV state and what the daemon would do")
     sub.add_parser("on", help="turn the TV on and switch to the configured input")
     off = sub.add_parser("off", help="turn the TV off")
@@ -1053,7 +1471,10 @@ def main(argv=None):
         _setup_logging("INFO")
         log.error("%s", e)
         return EX_CONFIG
-    _setup_logging("DEBUG" if args.verbose else cfg.log_level)
+    # On Windows `run` is started by the logon task under pythonw.exe, where
+    # there is no console to log to and no journal to log into.
+    _setup_logging("DEBUG" if args.verbose else cfg.log_level,
+                   to_file=IS_WIN and args.cmd == "run")
     if args.cmd == "run":
         log.info("%s starting (config: %s)", APP, cfg.source or "environment only")
     try:

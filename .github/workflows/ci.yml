@@ -13,6 +13,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows:
+    # The Windows backend is ctypes-only, so a runner can at least prove it
+    # imports, parses and degrades gracefully with no display attached.
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: compile
+        run: python -m py_compile roku_monitor.py
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI wiring (no TV configured)
+        run: |
+          python roku_monitor.py --help
+          python roku_monitor.py status
+        continue-on-error: true
+      - name: installer scripts parse
+        shell: pwsh
+        run: |
+          foreach ($f in 'install.ps1','uninstall.ps1') {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
+            Write-Host "$f ok"
+          }
+
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
