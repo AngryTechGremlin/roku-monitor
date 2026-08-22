@@ -391,11 +391,33 @@ class WindowsLogicTests(unittest.TestCase):
     def test_unknown_event_is_ignored(self):
         self.assertFalse(rm.handle_win_event(self.make_daemon(), "nonsense"))
 
-    def test_sampler_shape_without_windows(self):
-        s = rm.WindowsDisplaySampler().sample()   # list_windows_targets raises here
-        self.assertTrue(s.pc_on)
+    def fake_targets(self, targets):
+        """Swap the ctypes call out; never assume what displays the host has."""
+        orig = rm.list_windows_targets
+        rm.list_windows_targets = targets
+        self.addCleanup(lambda: setattr(rm, "list_windows_targets", orig))
+
+    def test_sampler_degrades_without_a_desktop(self):
+        """An SSH session has no desktop to query; that must not break sampling."""
+        def boom():
+            raise OSError("no interactive desktop")
+        self.fake_targets(boom)
+        s = rm.WindowsDisplaySampler().sample()
+        self.assertTrue(s.pc_on)          # still reports the cached display state
         self.assertEqual(s.connectors, [])
         self.assertIsNone(s.roku_name)
+
+    def test_sampler_identifies_the_roku_and_tracks_display_state(self):
+        self.fake_targets(lambda: [rm.WinTarget("DELL S2722DC", False),
+                                   rm.WinTarget("Roku TV", True)])
+        sampler = rm.WindowsDisplaySampler()
+        s = sampler.sample()
+        self.assertEqual(s.roku_name, "Roku TV")
+        self.assertEqual(s.roku, "driven")
+        sampler.set_display_on(False)
+        s = sampler.sample()
+        self.assertFalse(s.pc_on)
+        self.assertEqual(s.roku, "idle")
 
 
 class OutputEncodingTests(unittest.TestCase):
