@@ -397,6 +397,21 @@ class WindowsLogicTests(unittest.TestCase):
         self.assertIsNone(s.roku_name)
 
 
+class OutputEncodingTests(unittest.TestCase):
+    def test_legacy_codepage_does_not_raise(self):
+        """A cp437 console must not kill the process on an em dash."""
+        import io
+        buf = io.TextIOWrapper(io.BytesIO(), encoding="cp437", errors="strict")
+        orig = sys.stdout
+        try:
+            sys.stdout = buf
+            rm._make_output_lossy()
+            print("displays off — TV off…")  # em dash + ellipsis
+        finally:
+            sys.stdout = orig
+        self.assertEqual(buf.errors, "replace")
+
+
 class ConfigPathTests(unittest.TestCase):
     def test_win32_config_path(self):
         orig_win, orig_appdata = rm.IS_WIN, os.environ.get("APPDATA")

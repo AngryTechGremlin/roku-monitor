@@ -553,15 +553,44 @@ def run_windows_loop(daemon):
         _fields_ = [("PowerSetting", GUID), ("DataLength", wintypes.DWORD),
                     ("Data", ctypes.c_ubyte * 4)]
 
+    LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+    WPARAM, LPARAM = ctypes.c_size_t, ctypes.c_ssize_t
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM)
+
+    # Declare every signature we use. Without this ctypes assumes C int for
+    # arguments, and a 64-bit lparam (a pointer, during WM_NCCREATE) overflows
+    # — which fails window creation before the daemon ever starts.
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
+    user32.DefWindowProcW.restype = LRESULT
+    user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                       wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                       wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
+    user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, wintypes.LPVOID]
+    user32.SetTimer.restype = ctypes.c_size_t
+    user32.ShutdownBlockReasonCreate.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+    user32.ShutdownBlockReasonDestroy.argtypes = [wintypes.HWND]
+    user32.RegisterPowerSettingNotification.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    user32.RegisterPowerSettingNotification.restype = wintypes.HANDLE
+    user32.GetMessageW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    try:
+        user32.RegisterSuspendResumeNotification.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        user32.RegisterSuspendResumeNotification.restype = wintypes.HANDLE
+    except AttributeError:
+        pass
+
     # Only one daemon per user: systemd gave us this for free on Linux.
     mutex = kernel32.CreateMutexW(None, False, "Local\\" + APP)
     if mutex and ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         log.info("another %s is already running — exiting", APP)
         return 0
-
-    LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
-    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
-                                 ctypes.c_size_t, ctypes.c_ssize_t)
 
     def on_message(hwnd, msg, wparam, lparam):
         if msg == WM_TIMER:
@@ -621,7 +650,8 @@ def run_windows_loop(daemon):
     if not user32.RegisterClassW(ctypes.byref(wc)):
         raise OSError(f"RegisterClassW failed: {ctypes.get_last_error()}")
 
-    user32.CreateWindowExW.restype = wintypes.HWND
+    # WS_OVERLAPPEDWINDOW, never shown: a message-only window would not get
+    # the broadcast messages (WM_ENDSESSION, PBT_APMSUSPEND) we depend on.
     hwnd = user32.CreateWindowExW(0, wc.lpszClassName, APP, 0x00CF0000,
                                   0, 0, 0, 0, None, None, wc.hInstance, None)
     if not hwnd:
@@ -1312,6 +1342,20 @@ class Daemon:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _make_output_lossy():
+    """Never let an unencodable character take the process down.
+
+    Windows consoles still run legacy code pages (cp437/cp850 cannot represent
+    an em dash), and Python's default is to raise. A replacement character in
+    one log line is always better than a dead daemon.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # pythonw (None), or a stream that cannot be reconfigured
+
+
 def _setup_logging(level, to_file=False):
     handlers = []
     # Under pythonw.exe (how the Windows service runs) sys.stderr is None.
@@ -1464,6 +1508,7 @@ def main(argv=None):
     off = sub.add_parser("off", help="turn the TV off")
     off.add_argument("--force", action="store_true", help="ignore ROKU_ONLY_OFF_WHEN_ON_INPUT")
     args = p.parse_args(argv)
+    _make_output_lossy()
 
     try:
         cfg = Config.load(args.config)

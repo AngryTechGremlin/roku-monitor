@@ -62,7 +62,7 @@ if (-not (Test-Path $Conf)) {
 }
 
 function Set-Conf($key, $value) {
-    if ($value -match "[`r`n]") { Die "refusing to write $key: value contains a newline" }
+    if ($value -match "[`r`n]") { Die "refusing to write ${key}: value contains a newline" }
     $lines = Get-Content $Conf
     if ($lines -match "^$key=") {
         $lines = $lines -replace "^$key=.*", "$key=$value"
@@ -135,18 +135,26 @@ if (-not $NoDiscover) {
 # --- logon task --------------------------------------------------------------
 # Must run in the interactive session: the daemon listens for display-power
 # messages on a hidden window, which only exists in a real user session.
-$action    = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$Script`" run" -WorkingDirectory $RepoDir
-$trigger   = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+$action = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$Script`" run" -WorkingDirectory $RepoDir
+# Not "$env:USERDOMAIN\$env:USERNAME": on a workgroup machine USERDOMAIN can be
+# WORKGROUP, which Task Scheduler rejects as a principal. The identity name is
+# always right (MACHINE\user locally, DOMAIN\user when joined).
+$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$trigger   = New-ScheduledTaskTrigger -AtLogOn -User $me
+$principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
 # ExecutionTimeLimit 0 = no limit; the default (3 days) would kill the daemon.
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                 -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) `
                 -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
                 -StartWhenAvailable
+$haveTask = $false
 try {
     Register-ScheduledTask -TaskName $App -Action $action -Trigger $trigger -Principal $principal `
         -Settings $settings -Description 'Roku TV as a monitor: mirror what the GPU is driving' -Force | Out-Null
-    Say "registered scheduled task '$App' (runs at logon)"
+    $haveTask = $true
+    Say "registered scheduled task '$App' (runs at logon, as $me)"
+    # A previous run may have left the fallback behind; two copies would fight.
+    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $App -ErrorAction SilentlyContinue
 } catch {
     Warn "could not register the scheduled task ($($_.Exception.Message)); falling back to a Run key (no auto-restart)"
     New-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name $App `
@@ -154,7 +162,12 @@ try {
 }
 
 if (-not $NoStart) {
-    try { Start-ScheduledTask -TaskName $App; Start-Sleep -Seconds 2; Say 'started' } catch { Warn "could not start: $($_.Exception.Message)" }
+    if ($haveTask) {
+        try { Start-ScheduledTask -TaskName $App; Start-Sleep -Seconds 3; Say 'started' }
+        catch { Warn "could not start: $($_.Exception.Message)" }
+    } else {
+        Say 'sign out and back in to start it (or run it once by hand)'
+    }
 }
 
 Say 'done.'
