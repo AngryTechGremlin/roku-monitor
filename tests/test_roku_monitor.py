@@ -262,6 +262,59 @@ class DaemonDebounceTests(unittest.TestCase):
         d._initial()
         self.assertEqual(d.reconciler.requests, [(rm.OFF, False)])
 
+    def test_urgent_off_not_suppressed_after_intervening_on(self):
+        d = self.make([True, True])
+        d._initial()
+        d._commit(rm.OFF, "test")
+        d.reconciler.last_off_at = __import__("time").monotonic()
+        d._commit(rm.ON, "test")
+        d._urgent_off("suspend")
+        self.assertEqual(d.reconciler.requests[-1], (rm.OFF, True))
+        self.assertEqual(d.committed, rm.OFF)
+
+    def test_urgent_off_suppressed_right_after_off(self):
+        d = self.make([False, False])
+        d._initial()
+        d.reconciler.last_off_at = __import__("time").monotonic()
+        d._urgent_off("stop")
+        self.assertEqual(d.reconciler.requests, [(rm.OFF, False)])
+
+    def test_fatal_quits_loop(self):
+        d = self.make([True, True])
+        quits = []
+        d.loop = type("L", (), {"quit": lambda self: quits.append(1)})()
+        d.reconciler.fatal = rm.EX_CONFIG
+        self.assertFalse(d.tick())
+        self.assertEqual(d.exit_code, rm.EX_CONFIG)
+        self.assertEqual(quits, [1])
+        self.assertTrue(d.stop_event.is_set())
+
+
+class WrongDeviceTests(unittest.TestCase):
+    class FakeRoku:
+        def power_mode(self, timeout=None):
+            raise rm.WrongDevice("serial mismatch")
+
+    def test_propagates_to_reconciler_fatal(self):
+        cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_TV_SERIAL": "AAA"})
+        with self.assertRaises(rm.WrongDevice):
+            rm.ensure_on(self.FakeRoku(), cfg)
+        with self.assertRaises(rm.WrongDevice):
+            rm.ensure_off(self.FakeRoku(), cfg)
+        rec = rm.Reconciler(self.FakeRoku(), cfg)
+        rec.start()
+        rec.request(rm.OFF)
+        self.assertTrue(rec.wait_done(5))
+        self.assertEqual(rec.fatal, rm.EX_CONFIG)
+
+    def test_bad_mac_is_config_error(self):
+        with self.assertRaises(rm.ConfigError):
+            rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_TV_MAC": "nope"})
+
+    def test_unparseable_xml_is_ecp_error(self):
+        with self.assertRaises(rm.EcpError):
+            rm.parse_active_app("<active-app><app>Roku")
+
 
 if __name__ == "__main__":
     unittest.main()

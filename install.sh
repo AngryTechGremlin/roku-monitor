@@ -38,7 +38,9 @@ fi
 command -v systemctl >/dev/null || die "systemctl not found; this installer needs systemd --user"
 systemctl --user show-environment >/dev/null 2>&1 || die "systemd --user is not reachable. Run this from a desktop session (not plain SSH)."
 [ -d /sys/class/drm ] || die "/sys/class/drm is missing; this needs a Linux DRM/KMS graphics driver"
-if ! /usr/bin/python3 "$REPO_DIR/roku_monitor.py" status 2>/dev/null | grep -q '<- Roku'; then
+# capture first: status exits 1 when no TV is configured yet, which must not trip pipefail here
+status_out=$(/usr/bin/python3 "$REPO_DIR/roku_monitor.py" status 2>/dev/null || true)
+if ! grep -q '<- Roku' <<<"$status_out"; then
   warn "no connected display with a Roku EDID was found right now. If the TV is off or on another"
   warn "input that is normal; otherwise set ROKU_CONNECTOR=<name> (see: ls /sys/class/drm) in $CONF"
 fi
@@ -63,14 +65,15 @@ fi
 
 # --- which TV? ---------------------------------------------------------------
 set_conf() { # key value  (keys are fixed names from .env.example, so sed on ^KEY= is safe)
+  case "$2" in *[\|\&\\]*|*$'\n'*) die "refusing to write $1: value contains | & \\ or a newline" ;; esac
   if grep -q "^$1=" "$CONF"; then sed -i "s|^$1=.*|$1=$2|" "$CONF"; else printf '%s=%s\n' "$1" "$2" >>"$CONF"; fi
 }
 if [ "$DISCOVER" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
   say "Looking for Roku TVs on your network (turn the TV on first)..."
   tmp=$(mktemp)
   /usr/bin/python3 "$REPO_DIR/roku_monitor.py" discover | tee "$tmp" || true
-  # rows look like: " 1  192.168.x.y  Name  TV  SERIAL  MAC  PowerOn"
-  mapfile -t rows < <(grep -E '^ *[0-9]+ +[0-9.]+ ' "$tmp" || true)
+  # rows look like: " 1  <ip>  Name  TV  SERIAL  MAC  PowerOn" (empty cells print as '-')
+  mapfile -t rows < <(grep -E '^ *[0-9]+ +[0-9.]+ ' "$tmp" | grep -v '(no ECP answer' || true)
   rm -f "$tmp"
   if [ "${#rows[@]}" -gt 0 ]; then
     printf 'Which one is the TV you use as a monitor? [1-%d, or s to skip] ' "${#rows[@]}"
@@ -82,11 +85,15 @@ if [ "$DISCOVER" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
       serial=$(awk '{print $(NF-2)}' <<<"$row")
       mac=$(awk '{print $(NF-1)}' <<<"$row")
       set_conf ROKU_TV_IP "$ip"
-      [[ "$serial" =~ ^[A-Za-z0-9]+$ ]] && set_conf ROKU_TV_SERIAL "$serial"
+      [[ "$serial" =~ ^[A-Za-z0-9]{6,}$ ]] && set_conf ROKU_TV_SERIAL "$serial"
       [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] && set_conf ROKU_TV_MAC "$mac"
-      printf 'Which input is the PC on? [hdmi1/hdmi2/hdmi3/hdmi4/av1] (hdmi3) '
-      read -r inp
-      inp=${inp:-hdmi3}
+      while :; do
+        printf 'Which input is the PC on? [hdmi1/hdmi2/hdmi3/hdmi4/av1/tuner] (hdmi3) '
+        read -r inp
+        inp=${inp:-hdmi3}; inp=${inp,,}; inp=${inp// /}   # 'HDMI 3' -> hdmi3
+        [[ "$inp" =~ ^[1-4]$ ]] && inp=hdmi$inp            # '3' -> hdmi3
+        case "$inp" in hdmi[1-4]|av1|tuner) break ;; *) warn "'$inp' is not one of hdmi1..4/av1/tuner" ;; esac
+      done
       set_conf ROKU_INPUT "$inp"
       say "wrote ROKU_TV_IP=$ip ROKU_INPUT=$inp to $CONF"
     else

@@ -18,6 +18,7 @@ Subcommands: run | discover | status | on | off
 
 import argparse
 import glob
+import http.client
 import ipaddress
 import logging
 import os
@@ -137,6 +138,11 @@ class Config:
         self.tv_ip = v["ROKU_TV_IP"]
         self.serial = v["ROKU_TV_SERIAL"]
         self.mac = v["ROKU_TV_MAC"]
+        if self.mac:
+            try:
+                magic_packet(self.mac)
+            except ValueError as e:
+                raise ConfigError(f"ROKU_TV_MAC: {e}")
         self.input_name = v["ROKU_INPUT"]
         self.input_key, self.input_app = input_spec(self.input_name)
         self.connector = v["ROKU_CONNECTOR"]
@@ -318,8 +324,15 @@ class WrongDevice(EcpError):
     """The device at ROKU_TV_IP is not the TV we were configured for."""
 
 
+def _xml(xml_text):
+    try:
+        return ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        raise EcpError(f"unparseable ECP response: {e}") from None
+
+
 def parse_device_info(xml_text):
-    root = ET.fromstring(xml_text)
+    root = _xml(xml_text)
     return {child.tag: (child.text or "").strip() for child in root}
 
 
@@ -329,7 +342,7 @@ def parse_active_app(xml_text):
     <active-app><app id="tvinput.hdmi3" type="tvin">HDMI 3</app>…    (input)
     …<screensaver id="55545" type="ssvr">Roku City</screensaver>     (sibling)
     """
-    root = ET.fromstring(xml_text)
+    root = _xml(xml_text)
     app = root.find("app")
     if app is None:
         return None, "Unknown"
@@ -337,7 +350,7 @@ def parse_active_app(xml_text):
 
 
 def parse_apps(xml_text):
-    root = ET.fromstring(xml_text)
+    root = _xml(xml_text)
     return [(a.get("id", ""), (a.text or "").strip()) for a in root.findall("app")]
 
 
@@ -363,8 +376,8 @@ class Roku:
                 raise EcpUnreachable(f"{path}: {e.reason}") from None
             except ConnectionRefusedError:
                 raise EcpRefused(f"{path}: connection refused") from None
-            except (OSError, TimeoutError) as e:  # socket.timeout is an OSError subclass
-                raise EcpUnreachable(f"{path}: {e}") from None
+            except (OSError, TimeoutError, http.client.HTTPException) as e:  # socket.timeout is an OSError
+                raise EcpUnreachable(f"{path}: {type(e).__name__}: {e}") from None
 
     def device_info(self, timeout=None):
         info = parse_device_info(self._req("GET", "/query/device-info", timeout))
@@ -485,7 +498,7 @@ def _sleep_unless(seconds, stale):
     while time.monotonic() < end:
         if stale():
             return False
-        time.sleep(min(0.25, end - time.monotonic()))
+        time.sleep(max(0.0, min(0.25, end - time.monotonic())))
     return not stale()
 
 
@@ -506,16 +519,15 @@ def ensure_on(roku, cfg, stale=lambda: False):
     except EcpUnreachable as e:
         log.info("TV unreachable (%s) — sending PowerOn%s", e, " + WoL" if cfg.mac else "")
         mode = None
+    except WrongDevice:
+        raise
     except EcpError as e:
         log.warning("%s", _describe_power_mode_failure(e))
         return False
 
     if mode != "PowerOn":
         if cfg.mac:
-            try:
-                send_wol(cfg.mac, cfg.tv_ip, cfg.wol_broadcast)
-            except ValueError as e:
-                log.warning("ROKU_TV_MAC invalid, not sending WoL: %s", e)
+            send_wol(cfg.mac, cfg.tv_ip, cfg.wol_broadcast)
         try:
             roku.keypress("PowerOn")
             log.info("sent PowerOn (TV was %s)", mode or "unreachable")
@@ -535,6 +547,8 @@ def ensure_on(roku, cfg, stale=lambda: False):
                 if cfg.mac and time.monotonic() - last_wol >= 10:
                     send_wol(cfg.mac, cfg.tv_ip, cfg.wol_broadcast)
                     last_wol = time.monotonic()
+            except WrongDevice:
+                raise
             except EcpError as e:
                 log.warning("%s", _describe_power_mode_failure(e))
                 return False
@@ -593,6 +607,8 @@ def ensure_off(roku, cfg, stale=lambda: False, force=False, urgent=False):
             err = e
             if i == 0 and not urgent:
                 time.sleep(1.0)
+        except WrongDevice:
+            raise
         except EcpError as e:
             log.warning("%s", _describe_power_mode_failure(e))
             return False
@@ -630,6 +646,8 @@ def ensure_off(roku, cfg, stale=lambda: False, force=False, urgent=False):
             roku.keypress("PowerOff")
         except EcpUnreachable:
             return True
+        except WrongDevice:
+            raise
         except EcpError as e:
             log.warning("PowerOff verify failed: %s", e)
             return False
@@ -737,7 +755,8 @@ class Daemon:
             log.exception("sampler tick failed")
         if self.reconciler.fatal is not None:
             self.exit_code = self.reconciler.fatal
-            self.stop_event.set()
+            self._quit()
+            return False  # removes the GLib timeout source
         return True
 
     def _tick(self):
@@ -785,7 +804,10 @@ class Daemon:
     # -- stop / sleep / shutdown --------------------------------------------
 
     def _urgent_off(self, why):
-        recent = self.reconciler.last_off_at is not None and time.monotonic() - self.reconciler.last_off_at < 20
+        # Skip only if the last thing we did was an OFF and it was moments ago
+        # (shutdown fires PrepareForShutdown and then SIGTERM back to back).
+        recent = (self.committed == OFF and self.reconciler.last_off_at is not None
+                  and time.monotonic() - self.reconciler.last_off_at < 20)
         if recent:
             log.info("%s: TV was turned off moments ago, nothing to do", why)
             return
@@ -953,11 +975,12 @@ def cmd_discover(args, cfg):
     w = max(len(r[1]) for r in rows)
     print(f"\n{'#':>2}  {'IP':<15} {'Name':<{w}}  {'Kind':<22} {'Serial':<14} {'MAC':<17} Power")
     for i, r in enumerate(rows, 1):
-        print(f"{i:>2}  {r[0]:<15} {r[1]:<{w}}  {r[2]:<22} {r[3]:<14} {r[4]:<17} {r[5]}")
+        # '-' for empty cells keeps the last three columns parseable (install.sh reads them)
+        print(f"{i:>2}  {r[0]:<15} {r[1]:<{w}}  {r[2]:<22} {r[3] or '-':<14} {r[4] or '-':<17} {r[5] or '-'}")
     print(f"\nPut the TV you use as a monitor into {default_config_path()}:")
     for r in rows:
         if r[2] == "TV":
-            print(f"  ROKU_TV_IP={r[0]}\n  ROKU_TV_SERIAL={r[3]}\n  ROKU_TV_MAC={r[4]}")
+            print(f"  # {r[1]}\n  ROKU_TV_IP={r[0]}\n  ROKU_TV_SERIAL={r[3]}\n  ROKU_TV_MAC={r[4]}")
     return 0
 
 
@@ -1036,7 +1059,7 @@ def main(argv=None):
     try:
         return {"run": cmd_run, "discover": cmd_discover, "status": cmd_status,
                 "on": cmd_on, "off": cmd_off}[args.cmd](args, cfg)
-    except ConfigError as e:
+    except (ConfigError, WrongDevice) as e:
         log.error("%s", e)
         return EX_CONFIG
     except KeyboardInterrupt:
