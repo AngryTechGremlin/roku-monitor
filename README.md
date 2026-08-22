@@ -118,19 +118,25 @@ The states you will see:
 | output disabled in display settings | `connected / disabled / Off` (other outputs still `enabled / On`) |
 | TV off long enough to drop hot-plug, or cable out | `disconnected / disabled / Off` |
 
-**Why the power decision uses *all* connectors, not just the TV's.** Roku TVs
-drop HDMI hot-plug some minutes after they turn off, and raise it again when
-they power on. While it is down, the TV's connector reads `disconnected`
-whatever the PC wants — so "the TV's output lit up" can never be the wake
-trigger (the TV would have to be on first). The daemon therefore keys on *any
-output being driven*: when your other monitor wakes, the TV is told to wake;
-when everything goes dark, the TV goes dark. The TV's own connector is
-reported in `status` and the logs for your information only.
+**Why the power decision uses *all* connectors, not just the TV's.** A Roku
+TV pulses HDMI hot-plug for about a second when it powers off, and a TV that
+has gone to deep sleep (Fast TV start off) is reported to drop it entirely
+after 10–15 minutes and raise it again on power-on. While hot-plug is down the
+TV's connector reads `disconnected` whatever the PC wants — so "the TV's
+output lit up" can never be the wake trigger (the TV would have to be on
+first). The daemon therefore keys on *any output being driven*: when your
+other monitor wakes, the TV is told to wake; when everything goes dark, the
+TV goes dark. The TV's own connector is reported in `status` and the logs for
+your information only.
 
-Side effect you should know about: when the TV drops hot-plug your desktop
+Side effect you should know about: if the TV does drop hot-plug, your desktop
 sees a monitor unplugged and may move windows onto the remaining screen (and
 not move them back). That is your compositor reacting to the TV, not this
-daemon; the CEC tip under *Requirements* is the known mitigation.
+daemon. With Fast TV start on, the TV this was developed against kept
+hot-plug asserted through every standby period observed (20 minutes of
+sampling, standby stretches of up to 9 minutes) — so in the recommended
+configuration the layout stays put; the CEC tip under *Requirements* is the
+known mitigation if yours behaves differently.
 
 **Desired state, not commands.** An edge in "displays driven?" becomes a
 desired TV state (on or off) handed to one worker thread that owns all talk
