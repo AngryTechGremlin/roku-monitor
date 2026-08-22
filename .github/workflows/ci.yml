@@ -1,0 +1,41 @@
+name: ci
+
+# "Does it parse and do the pure parts behave?" on every push and PR. Nothing
+# here reaches a TV or a desktop session; python3-gi is deliberately absent so
+# the lazy-import rule is enforced.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: compile
+        run: python -m py_compile roku_monitor.py
+      - name: unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI wiring (no gi, no TV)
+        run: |
+          python roku_monitor.py --help
+          python roku_monitor.py status || true
+      - name: shell scripts
+        run: |
+          bash -n install.sh uninstall.sh
+          shellcheck install.sh uninstall.sh
+      - name: no personal data in tracked files
+        run: |
+          set -e
+          if git grep -nE '192\.168\.[0-9]+\.[0-9]+|([0-9a-f]{2}:){5}[0-9a-f]{2}' -- . ':!tests/*' ; then
+            echo "LAN addresses found in tracked files" >&2; exit 1; fi
+          echo "clean"
