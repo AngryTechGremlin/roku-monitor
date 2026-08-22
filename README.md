@@ -309,7 +309,7 @@ busctl --user set-property org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/Disp
 
 ```powershell
 # Windows
-Get-Content "$env:LOCALAPPDATA\roku-monitor\roku-monitor.log" -Tail 20 -Wait
+Get-Content "$env:LOCALAPPDATA\roku-monitor\roku-monitor.log" -Tail 20 -Wait -Encoding UTF8
 Get-ScheduledTaskInfo -TaskName roku-monitor
 python roku_monitor.py status
 Invoke-WebRequest "http://<tv-ip>:8060/query/active-app" -UseBasicParsing | Select-Object -Expand Content

@@ -374,7 +374,7 @@ def handle_win_event(daemon, kind, value=None):
         if cfg.off_on_sleep:
             daemon._urgent_off("suspend")
         else:
-            log.info("ROKU_OFF_ON_SLEEP=false — leaving the TV on")
+            log.info("ROKU_OFF_ON_SLEEP=false - leaving the TV on")
         return True
     if kind == EV_RESUME:
         log.info("system resumed")
@@ -589,7 +589,7 @@ def run_windows_loop(daemon):
     # Only one daemon per user: systemd gave us this for free on Linux.
     mutex = kernel32.CreateMutexW(None, False, "Local\\" + APP)
     if mutex and ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
-        log.info("another %s is already running — exiting", APP)
+        log.info("another %s is already running - exiting", APP)
         return 0
 
     def on_message(hwnd, msg, wparam, lparam):
@@ -897,7 +897,7 @@ def _describe_power_mode_failure(exc):
         return ("TV refused the command (HTTP 403): on the TV set Settings > System > "
                 "Advanced system settings > Control by mobile apps > Network access = Default")
     if isinstance(exc, EcpRefused):
-        return ("TV is up but nothing answers on port 8060 — is 'Control by mobile apps' "
+        return ("TV is up but nothing answers on port 8060 - is 'Control by mobile apps' "
                 "disabled, or is this not a Roku?")
     return str(exc)
 
@@ -907,7 +907,7 @@ def ensure_on(roku, cfg, stale=lambda: False):
     try:
         mode = roku.power_mode()
     except EcpUnreachable as e:
-        log.info("TV unreachable (%s) — sending PowerOn%s", e, " + WoL" if cfg.mac else "")
+        log.info("TV unreachable (%s) - sending PowerOn%s", e, " + WoL" if cfg.mac else "")
         mode = None
     except WrongDevice:
         raise
@@ -958,7 +958,7 @@ def ensure_on(roku, cfg, stale=lambda: False):
             if app_id == cfg.input_app:
                 log.info("TV is on %s (%s)", cfg.input_name.upper(), name)
                 return True
-            log.info("TV is on '%s' — switching to %s", name, cfg.input_name.upper())
+            log.info("TV is on '%s' - switching to %s", name, cfg.input_name.upper())
             if attempt == 0:
                 roku.launch(cfg.input_app)
             else:
@@ -1003,7 +1003,7 @@ def ensure_off(roku, cfg, stale=lambda: False, force=False, urgent=False):
             log.warning("%s", _describe_power_mode_failure(e))
             return False
     if mode is None:
-        log.info("TV unreachable (%s) — treating as already off", err)
+        log.info("TV unreachable (%s) - treating as already off", err)
         return True
     if mode != "PowerOn":
         log.info("TV already off (%s)", mode)
@@ -1012,10 +1012,10 @@ def ensure_off(roku, cfg, stale=lambda: False, force=False, urgent=False):
         try:
             app_id, name = roku.active_app(timeout=t)
         except EcpError as e:
-            log.warning("could not read active app (%s) — leaving the TV on", e)
+            log.warning("could not read active app (%s) - leaving the TV on", e)
             return True
         if app_id != cfg.input_app:
-            log.info("TV is on '%s' (%s), not %s — leaving it on (ROKU_ONLY_OFF_WHEN_ON_INPUT)",
+            log.info("TV is on '%s' (%s), not %s - leaving it on (ROKU_ONLY_OFF_WHEN_ON_INPUT)",
                      name, app_id or "no id", cfg.input_name.upper())
             return True
     try:
@@ -1113,7 +1113,7 @@ class Reconciler(threading.Thread):
             if ensure_on(self.roku, self.cfg, stale):
                 return
             log.info("retrying TV on in a moment")
-        log.warning("giving up on TV on until the displays change again — "
+        log.warning("giving up on TV on until the displays change again - "
                     "is the TV powered, on the network, with 'Fast TV start' enabled?")
 
 
@@ -1161,7 +1161,7 @@ class Daemon:
         if s.pc_on:
             self.off_samples = 0
             if self.off_deadline is not None:
-                log.info("displays came back — TV stays on")
+                log.info("displays came back - TV stays on")
                 self.off_deadline = None
             if self.committed != ON:
                 self._commit(ON, "displays on")
@@ -1171,7 +1171,7 @@ class Daemon:
             self.off_samples += 1
             if self.off_samples >= 2 and self.off_deadline is None:
                 self.off_deadline = now + self.cfg.off_delay_s
-                log.info("displays off — TV off in %.0fs unless they come back", self.cfg.off_delay_s)
+                log.info("displays off - TV off in %.0fs unless they come back", self.cfg.off_delay_s)
             if self.off_deadline is not None and now >= self.off_deadline:
                 self.off_deadline = None
                 self._commit(OFF, "displays still off")
@@ -1210,15 +1210,15 @@ class Daemon:
     def on_term(self):
         if not self.stop_event.is_set():
             if self.shutdown_seen:
-                log.info("SIGTERM during shutdown — already handled")
+                log.info("SIGTERM during shutdown - already handled")
             elif self.cfg.off_on_stop:
                 self._urgent_off("stopping")
             else:
-                log.info("stopping — leaving the TV as it is (ROKU_OFF_ON_STOP=false)")
+                log.info("stopping - leaving the TV as it is (ROKU_OFF_ON_STOP=false)")
         self._quit()
 
     def on_int(self):
-        log.info("interrupted — leaving the TV as it is")
+        log.info("interrupted - leaving the TV as it is")
         self._quit()
 
     def _quit(self):
@@ -1276,7 +1276,7 @@ class Daemon:
                 if self.cfg.off_on_sleep:
                     self._urgent_off("suspend")
                 else:
-                    log.info("ROKU_OFF_ON_SLEEP=false — leaving the TV on")
+                    log.info("ROKU_OFF_ON_SLEEP=false - leaving the TV on")
             else:
                 log.info("system resumed")
                 self.sleeping = False
@@ -1404,7 +1404,7 @@ def cmd_discover(args, cfg):
     ips = ssdp_discover()
     if not ips:
         print("No Roku answered. Is the TV on and on the same network?\n"
-              "Some networks do not deliver multicast to every device — if you know the TV's\n"
+              "Some networks do not deliver multicast to every device - if you know the TV's\n"
               f"address, use: {APP} discover --ip <tv-ip>")
         return 1
     rows = []
@@ -1446,7 +1446,7 @@ def cmd_status(args, cfg):
         for c in s.connectors:
             print(f"  {c!r}")
         if not s.connectors:
-            print("  (no topology available — running without an interactive desktop?)")
+            print("  (no topology available - running without an interactive desktop?)")
         print(f"Roku monitor: {s.roku_name or 'not identified'}")
     else:
         print(f"PC displays driven: {'YES' if s.pc_on else 'no'}")

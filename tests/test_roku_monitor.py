@@ -2,6 +2,7 @@
 everything CI can actually prove about the logic."""
 
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -410,6 +411,23 @@ class OutputEncodingTests(unittest.TestCase):
         finally:
             sys.stdout = orig
         self.assertEqual(buf.errors, "replace")
+
+
+class LogAsciiTests(unittest.TestCase):
+    def test_runtime_messages_are_ascii(self):
+        """Log lines must survive any code page and any log reader.
+
+        Windows writes the log as UTF-8 but PowerShell 5.1's Get-Content reads
+        it as ANSI, so a stray em dash turns into mojibake for the one person
+        most likely to be reading it: someone debugging.
+        """
+        src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "roku_monitor.py"), encoding="utf-8").read()
+        bad = [ln.strip() for ln in src.split("\n")
+               if re.search(r"(log\.\w+\(|print\()", ln)
+               and re.search(r"[^\x00-\x7F]", ln)
+               and not ln.strip().startswith("#")]
+        self.assertEqual(bad, [], "non-ASCII in runtime output")
 
 
 class ConfigPathTests(unittest.TestCase):
