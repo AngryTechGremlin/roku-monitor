@@ -13,6 +13,10 @@ kernel's DRM state on Linux, the console display state on Windows — rather tha
 trusting a desktop environment's idea of "idle". So it works under GNOME, KDE,
 Sway and X11, and on Windows 10/11.
 
+Optional, on Linux: **the PC's volume keys and slider drive the TV's own
+volume** (`./install.sh --volume`) — full range, no remote on the desk, nothing
+attenuated twice. See *Linux: the volume* below.
+
 ## Requirements
 
 **PC — Linux**
@@ -23,6 +27,9 @@ Sway and X11, and on Windows 10/11.
   turned off *before* suspend/shutdown takes the network down. Without it the
   TV still follows your displays; it just may stay on across a suspend.
 - `systemd --user` (any systemd desktop distro).
+- For the optional volume mirror: PipeWire ≥ 1.0 with WirePlumber ≥ 0.5 and
+  their CLI tools `pw-dump` and `wpctl` (packages `pipewire-bin`,
+  `wireplumber` — stock on Ubuntu desktop; tested with 1.6.2 / 0.5.13).
 
 **PC — Windows**
 - Windows 10 or 11. Tested on Windows 11 Pro.
@@ -69,6 +76,13 @@ The installer (no `sudo`) checks the prerequisites, symlinks the script to
 discovery so you can pick the TV (writing its IP, serial and MAC for you),
 asks which input the PC is on, and enables the service. Turn the TV on before
 running it — a Roku in deep sleep does not answer discovery.
+
+Add `--volume` (now or later, same command) to make the PC's volume control
+drive the TV's volume: it writes a small PipeWire drop-in
+(`~/.config/pipewire/pipewire.conf.d/90-roku-monitor.conf`) that adds a
+**"Roku TV"** output, restarts PipeWire once (sound pauses for a second),
+sets `ROKU_VOLUME=true` and restarts the service. The TV must be on (or in
+Fast-start standby) so the installer can see which HDMI sink feeds it.
 
 ### Windows
 
@@ -128,6 +142,7 @@ ones that matter:
 | `ROKU_OFF_ON_SLEEP` / `ROKU_OFF_ON_STOP` | `true` | Turn the TV off before suspend / when the service stops (logout, `systemctl --user stop`). A `restart` is a stop+start, so expect a brief TV off/on blink; set `ROKU_OFF_ON_STOP=false` if that bothers you. |
 | `ROKU_OFF_DELAY_S` | `10` | Grace after the displays go dark; cancelled if they light up again. Absorbs "blank, then you touch the mouse". |
 | `ROKU_POWERON_TIMEOUT_S` | `45` | How long to wait for the TV to report it is on (a cold boot is ~30 s). |
+| `ROKU_VOLUME` | `false` | *Linux only.* Mirror the "Roku TV" output's volume/mute to the TV, and the TV's back into the slider at power-on. `install.sh --volume` sets it; it is a switch because it changes the audio graph. |
 
 ## Commands
 
@@ -136,7 +151,7 @@ ones that matter:
 | `roku-monitor run` | The daemon (what the service runs). |
 | `roku-monitor discover` | SSDP scan; lists Rokus with name, kind, serial, MAC, power state. |
 | `roku-monitor discover --ip <tv-ip>` | Read one TV directly, for networks that block multicast. |
-| `roku-monitor status` | What the daemon sees: the display state, which monitor is the Roku, and the TV's power mode + active input. |
+| `roku-monitor status` | What the daemon sees: the display state, which monitor is the Roku, the TV's power mode + active input, and (Linux) the audio side: which sink feeds the TV, whether the "Roku TV" output exists and is the default, the TV's volume. |
 | `roku-monitor on` | One-shot "TV on + input" (exit 1 if it could not). |
 | `roku-monitor off [--force]` | One-shot TV off (`--force` ignores the shared-TV guard). |
 
@@ -194,6 +209,76 @@ hot-plug asserted through every standby period observed (20 minutes of
 sampling, standby stretches of up to 9 minutes) — so in the recommended
 configuration the layout stays put; the CEC tip under *Requirements* is the
 known mitigation if yours behaves differently.
+
+### Linux: the volume (optional)
+
+**The problem.** An HDMI audio sink has no hardware volume (`route.hw-volume
+= false`; ALSA offers only an on/off switch), so GNOME's slider and volume keys
+on it only scale the samples in software. The TV keeps whatever volume it had,
+and you end up either pinning the TV high and attenuating on the PC (losing
+range and resolution, and blasting anything else the TV plays) or keeping a
+remote on the desk. The fix is to make the PC's volume control *be* the TV's
+volume.
+
+**The PipeWire side: a "Roku TV" output that does not attenuate.**
+`install.sh --volume` adds a drop-in ([`roku-monitor.pipewire.conf`](roku-monitor.pipewire.conf))
+with a virtual sink named `roku-tv` ("Roku TV" in Settings → Sound) and a
+`module-loopback` relay from its monitor ports to the real HDMI sink. With
+PipeWire's default `monitor.channel-volumes = false` a sink's monitor carries
+the raw, pre-volume, pre-mute signal, so moving the "Roku TV" slider changes
+two numbers and not a single sample; the relay is volume-locked and the HDMI
+sink is kept at 100 %. The daemon makes "Roku TV" the default output (only
+ever replacing the raw HDMI sink, never a headset you picked), so the keys and
+the slider act on it. The objects belong to the PipeWire session, not the
+daemon: sound keeps flowing when the daemon is stopped or restarting, and
+WirePlumber re-links the relay itself when the HDMI sink disappears and comes
+back — which it does on *every* screen blank. (A side benefit: the default
+output no longer flaps on blank, so `gsd-media-keys: Unable to get default
+sink` stops appearing in the journal.) The relay is pinned with
+`node.dont-fallback` + `node.linger` — never `node.dont-reconnect`, which
+WirePlumber 0.5 answers by destroying the stream when its target vanishes —
+and without the pin it would fall back to the default output, i.e. into
+itself. Cost: one extra quantum of latency (~20 ms) and one PipeWire restart at
+install.
+
+**The TV side: a closed loop.** ECP can only press `VolumeUp` / `VolumeDown`
+/ `VolumeMute`, but the TV reports its state at `/query/audio-device`
+(`<global><volume>15</volume><muted>false</muted>`, undocumented but present
+on Roku OS 15). So every slider change is: read the TV, send the difference as
+key presses, re-read, correct — at most three rounds, then give up until the
+next change. Measured on the TV this was built against: one press is one step
+on the TV's 0–100 scale, 20 presses back to back are all honoured (~40 ms
+each, so 0→100 takes about 4 s and the TV draws its own volume bar meanwhile),
+`VolumeUp` unmutes, `VolumeDown` keeps a muted TV muted, and the TV mutes
+itself at 0; a model that steps differently is corrected by the re-read. The
+slider's percent maps 1:1 to the TV's number (PipeWire stores linear gain;
+GNOME and `wpctl` show its cube root, and so does the daemon), so both
+on-screen displays agree. Mute is the TV's mute; while the PC is muted only
+the mute is mirrored and the volume follows at unmute — stepping down first
+and unmuting last when it goes down, so the TV never comes back loud and ramps
+down audibly.
+
+**Who wins.** In between, the PC drives the TV. At sync points — daemon start,
+every successful "TV on" (i.e. every unblank), the "Roku TV" output
+(re)appearing — the TV's value is copied into the slider instead. That never
+blasts a quiet room at login and bounds any drift from the remote; there is no
+periodic polling of the TV (the README's "never re-asserts on a schedule" rule
+holds for volume too). Volume is only ever sent while the last "TV on" succeeded
+*and* the TV is showing the PC's input — a shared TV on Live TV is left alone —
+and a volume key the TV merely *accepts* (HTTP 202, standby) stops the job.
+All volume work runs on the same reconciler thread as power, power first, with
+short timeouts (1 s) and one attempt per change, so it can never hold up the
+pre-suspend "TV off".
+
+**What you see.** GNOME's OSD as usual; the TV's own volume bar while it
+catches up (key repeat is coalesced to the newest value, so holding the key
+ramps smoothly); `journalctl --user -u roku-monitor` lines like `TV volume 15
+-> 21`. Degraded mode worth knowing about: with the drop-in installed but the
+service stopped, the slider is a slider that moves nothing and the TV stays
+where it was (`roku-monitor status` shows both halves). To drop only the
+volume piece: remove `~/.config/pipewire/pipewire.conf.d/90-roku-monitor.conf`,
+`systemctl --user restart pipewire`, and set `ROKU_VOLUME=false`;
+`./uninstall.sh` does the same as part of removing everything.
 
 ### Windows: the console display state
 
@@ -276,6 +361,23 @@ corrected the next time the displays come back.
 - **Roku connector "not found"** (Linux) → the TV is off or on another input
   (its EDID is not readable then) — normal; it is cached once seen. If it is
   never found, set `ROKU_CONNECTOR`.
+- **Volume keys do nothing to the TV** (Linux) → `roku-monitor status`:
+  is the "Roku TV" output present and the default (`wpctl status`), is
+  `ROKU_VOLUME=true`, is the service running (`journalctl --user -u
+  roku-monitor -f` shows `TV volume 15 -> 21` per change)? A slider moved
+  while the TV is off or on another input is deliberately not sent; it is
+  re-synced from the TV at the next power-on.
+- **No sound after `install.sh --volume`** → the relay names an HDMI sink
+  that is not there: `pw-link -l | grep -A2 roku-tv-relay.playback` shows no
+  link. Moved the TV to another HDMI port, or a profile change renamed the
+  sink? `roku-monitor status` names the sink it finds and says when the
+  relay points elsewhere; re-run `./install.sh --volume` with the TV on (it
+  rewrites the drop-in) or edit `target.object` in
+  `~/.config/pipewire/pipewire.conf.d/90-roku-monitor.conf` and
+  `systemctl --user restart pipewire`.
+- **TV volume overshoots or oscillates** → your model steps more than one per
+  key; the log says `TV volume settled at N, wanted M`. The loop corrects
+  itself within a step; please report the model.
 - **Nothing happens on Windows** → check the log first
   (`%LOCALAPPDATA%\roku-monitor\roku-monitor.log`) and
   `Get-ScheduledTaskInfo -TaskName roku-monitor`. The daemon only sees display
@@ -300,6 +402,9 @@ journalctl --user -u roku-monitor -f
 systemd-inhibit --list                     # shows the daemon's delay lock
 curl -s http://<tv-ip>:8060/query/active-app
 curl -s -X POST http://<tv-ip>:8060/keypress/PowerOff
+curl -s http://<tv-ip>:8060/query/audio-device | grep -A2 '<global>'   # the TV's volume
+wpctl status; pw-link -l | grep -A2 roku-tv          # the "Roku TV" output and its relay
+pw-dump -m -N | grep -n '"channelVolumes"'           # slider moves as the daemon sees them
 # GNOME: Super+L blanks within ~1s — the fastest real test. Or force it:
 busctl --user set-property org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/DisplayConfig \
   org.gnome.Mutter.DisplayConfig PowerSaveMode i 3; sleep 20; busctl --user set-property \
@@ -318,9 +423,11 @@ powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOCONLOCK   # lock-to-blank delay
 
 ## Development
 
-`python3 -m unittest discover -s tests -v` — no TV, no desktop, no `gi`, and
-the Windows decision logic is covered on Linux too (its ctypes layer is a thin
-forwarder around a pure function). CI runs the suite on Ubuntu *and* Windows
+`python3 -m unittest discover -s tests -v` — no TV, no desktop, no `gi`, no
+PipeWire (the volume mirror's three subprocess seams are swapped for fakes and
+its parser is fed captured `pw-dump` shapes), and the Windows decision logic is
+covered on Linux too (its ctypes layer is a thin forwarder around a pure
+function). CI runs the suite on Ubuntu *and* Windows
 runners, plus `py_compile`, `--help`, shellcheck and a PowerShell parse check.
 Conventional Commits. Never commit LAN addresses, serials or MACs — tests use
 `192.0.2.x` documentation addresses, docs use `<tv-ip>`.
@@ -328,7 +435,10 @@ Conventional Commits. Never commit LAN addresses, serials or MACs — tests use
 Ideas not built yet: a GNOME-only tweak to ignore the 15-second screen wake
 GNOME does for notifications while locked; turning the TV off when only *its*
 output is disabled in display settings; re-discovering the TV by serial when
-its IP moves.
+its IP moves; a slow TV poll so the slider follows the remote live (today it
+catches up at the next power-on); shipping the drop-in with
+`monitor.channel-volumes = true` and flipping it at runtime so the slider
+still attenuates in software while the daemon is down.
 
 ## License
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Remove the roku-monitor user service and CLI shim.
+# Remove the roku-monitor user service, CLI shim and PipeWire drop-in.
 #   ./uninstall.sh [--purge]     --purge also deletes ~/.config/roku-monitor
 # Note: stopping the service turns the TV off (if ROKU_OFF_ON_STOP is true).
 set -euo pipefail
@@ -8,6 +8,7 @@ APP=roku-monitor
 BIN_DIR=${XDG_BIN_HOME:-$HOME/.local/bin}
 CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/$APP
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+PW_CONF=${XDG_CONFIG_HOME:-$HOME/.config}/pipewire/pipewire.conf.d/90-$APP.conf
 PURGE=0
 [ "${1:-}" = "--purge" ] && PURGE=1
 
@@ -15,6 +16,14 @@ systemctl --user disable --now "$APP.service" 2>/dev/null || true
 rm -f "$UNIT_DIR/$APP.service"
 systemctl --user daemon-reload 2>/dev/null || true
 rm -f "$BIN_DIR/$APP"
+if [ -f "$PW_CONF" ]; then
+  # Without the daemon the "Roku TV" output would be a slider that moves nothing,
+  # so take it out of the graph now; WirePlumber falls back to its stored HDMI default.
+  rm -f "$PW_CONF"
+  systemctl --user restart pipewire.service 2>/dev/null || true
+  [ -f "$CONF_DIR/env" ] && sed -i 's/^ROKU_VOLUME=.*/ROKU_VOLUME=false/' "$CONF_DIR/env"
+  echo "removed $PW_CONF (PipeWire restarted; sound is back on the plain HDMI output; ROKU_VOLUME=false)"
+fi
 if [ "$PURGE" = 1 ]; then
   rm -rf "$CONF_DIR"
   echo "removed service, CLI shim and $CONF_DIR"

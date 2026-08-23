@@ -18,6 +18,12 @@ never a desktop environment's intent:
           console (physical) display state, delivered to a hidden window,
           plus the suspend/session-end messages. ctypes only, no pip deps.
 
+Optional, Linux only (ROKU_VOLUME=true): the PC's volume control is the TV's
+volume. A "Roku TV" PipeWire output (roku-monitor.pipewire.conf) carries the
+sound to the HDMI sink unattenuated; the daemon mirrors its slider to the TV
+with VolumeUp/VolumeDown/VolumeMute, verified against the TV's own reading
+(/query/audio-device). Only `pw-dump` and `wpctl` are used (subprocesses).
+
 See README.md for the why behind each choice.
 
 Subcommands: run | discover | status | on | off
@@ -27,12 +33,14 @@ import argparse
 import glob
 import http.client
 import ipaddress
+import json
 import logging
 import logging.handlers
 import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -50,6 +58,18 @@ IS_WIN = sys.platform == "win32"
 # How long the pre-suspend/stop off may take. Windows allows only ~2 s at
 # PBT_APMSUSPEND and offers no delay-inhibitor equivalent to logind's.
 URGENT_OFF_BUDGET = 1.8 if IS_WIN else 3.0
+
+# Volume mirror (Linux): the PipeWire node names created by
+# roku-monitor.pipewire.conf, and the bounds of one slider -> TV job.
+PW_SINK = "roku-tv"                         # the virtual "Roku TV" output GNOME controls
+PW_RELAY_CAPTURE = "roku-tv-relay.capture"  # loopback: PW_SINK monitor -> ...
+PW_RELAY_PLAYBACK = "roku-tv-relay.playback"  # ... -> the real HDMI sink (target.object)
+SYNC = "SYNC"              # reconciler job: PC slider := TV volume ("TV wins")
+VOLUME_ROUNDS = 3          # per job: send keys, re-read the TV, correct; then give up
+VOLUME_KEY_GAP_S = 0.0     # measured: 20 keypresses back to back, none dropped (~40 ms each)
+VOLUME_SETTLE_S = 0.1      # the TV reports the new value at once; a small margin anyway
+VOLUME_TIMEOUT_S = 1.0     # per request, so a volume job never eats the urgent-off budget
+PW_DUMP_LADDER = (0, 3, 8, 15, 30, 60)  # seconds between pw-dump respawns (PipeWire restart)
 
 log = logging.getLogger(APP)
 
@@ -78,6 +98,7 @@ DEFAULTS = {
     "ROKU_POWERON_TIMEOUT_S": "45",
     "ROKU_WOL_BROADCAST": "255.255.255.255",
     "ROKU_LOG_LEVEL": "INFO",
+    "ROKU_VOLUME": "false",
 }
 
 
@@ -179,6 +200,7 @@ class Config:
             raise ConfigError(f"numeric setting is not a number: {e}")
         self.wol_broadcast = v["ROKU_WOL_BROADCAST"]
         self.log_level = v["ROKU_LOG_LEVEL"].upper()
+        self.volume = _as_bool(v["ROKU_VOLUME"])  # Linux only; needs install.sh --volume
 
     @classmethod
     def load(cls, explicit=None):
@@ -744,6 +766,22 @@ def parse_apps(xml_text):
     return [(a.get("id", ""), (a.text or "").strip()) for a in root.findall("app")]
 
 
+def parse_audio_device(xml_text):
+    """(volume 0-100, muted) from /query/audio-device's <global> block.
+
+    Undocumented but present on Roku OS 15 TVs; the only way to *read* the
+    TV's volume (ECP can only press VolumeUp/VolumeDown/VolumeMute).
+    """
+    g = _xml(xml_text).find("global")
+    if g is None or g.find("volume") is None:
+        raise EcpError("audio-device: no <global><volume> - this Roku does not report its volume")
+    try:
+        vol = int((g.findtext("volume") or "").strip())
+    except ValueError:
+        raise EcpError("audio-device: volume is not a number") from None
+    return max(0, min(100, vol)), (g.findtext("muted") or "").strip().lower() == "true"
+
+
 class Roku:
     def __init__(self, ip, timeout=3.0, expected_serial=""):
         self.ip = ip
@@ -751,13 +789,14 @@ class Roku:
         self.expected_serial = expected_serial
         self._lock = threading.Lock()  # the TV's tiny HTTP server dislikes overlap
 
-    def _req(self, method, path, timeout=None):
+    def _req(self, method, path, timeout=None, status=False):
         url = f"http://{self.ip}:{ECP_PORT}{path}"
         req = urllib.request.Request(url, method=method, data=b"" if method == "POST" else None)
         with self._lock:
             try:
                 with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
-                    return r.read().decode("utf-8", "replace")
+                    body = r.read().decode("utf-8", "replace")
+                    return (body, r.status) if status else body
             except urllib.error.HTTPError as e:
                 raise EcpHttpError(e.code, path) from None
             except urllib.error.URLError as e:
@@ -787,8 +826,13 @@ class Roku:
     def apps(self):
         return parse_apps(self._req("GET", "/query/apps"))
 
+    def audio_device(self, timeout=None):
+        return parse_audio_device(self._req("GET", "/query/audio-device", timeout))
+
     def keypress(self, key, timeout=None):
-        self._req("POST", "/keypress/" + urllib.parse.quote(key), timeout)
+        """Returns the HTTP status: 200 = pressed; 202 = accepted but not acted on
+        (observed for volume keys while the TV is in standby)."""
+        return self._req("POST", "/keypress/" + urllib.parse.quote(key), timeout, status=True)[1]
 
     def launch(self, app_id, timeout=None):
         self._req("POST", "/launch/" + urllib.parse.quote(app_id), timeout)
@@ -1046,6 +1090,397 @@ def ensure_off(roku, cfg, stale=lambda: False, force=False, urgent=False):
 
 
 # ---------------------------------------------------------------------------
+# Volume mirror (Linux, optional): the PC's volume control is the TV's volume
+#
+# The HDMI sink has no hardware volume, so a slider on it only scales samples
+# in software. roku-monitor.pipewire.conf therefore adds a virtual "Roku TV"
+# output (PW_SINK) whose monitor is pre-volume and pre-mute, relayed unchanged
+# to the HDMI sink. Its volume and mute are just numbers: this section watches
+# them through one `pw-dump -m` child and the reconciler thread mirrors them to
+# the TV with VolumeUp/VolumeDown/VolumeMute, verified against the TV's own
+# /query/audio-device. At sync points (start, TV on, the output (re)appearing)
+# the TV's value is copied into the slider instead ("TV wins"). Nothing here is
+# imported or touched on Windows; the tests swap the three subprocess seams.
+# ---------------------------------------------------------------------------
+
+def pw_percent(props):
+    """(percent, muted) from a node's Props, the way GNOME shows it.
+
+    PipeWire stores linear gain; GNOME and wpctl show its cube root (50% is
+    0.125), so this number matches the on-screen slider and the TV's 0-100.
+    """
+    vols = props.get("channelVolumes") or []
+    try:
+        linear = max(float(v) for v in vols) if vols else float(props.get("volume", 1.0))
+    except (TypeError, ValueError):
+        linear = 1.0
+    pct = int(round(100 * max(0.0, linear) ** (1.0 / 3.0)))
+    return max(0, min(100, pct)), bool(props.get("mute", False))
+
+
+def plan_volume_keys(tv_vol, tv_muted, pct, muted, step=1.0):
+    """ECP keys that move the TV from (tv_vol, tv_muted) towards (pct, muted).
+
+    Measured on a Roku TV (OS 15): one key is one step on 0-100, VolumeUp
+    unmutes, VolumeDown leaves a muted TV muted, VolumeMute toggles, and the TV
+    mutes itself at 0. So while the PC is muted only the mute is mirrored (the
+    volume follows at unmute); an unmute that goes up just presses Up, one that
+    goes down steps down first and unmutes last. `step` is how far one key was seen to move this TV; the caller re-reads and
+    calls again, so a model that differs still settles within VOLUME_ROUNDS.
+    """
+    if muted:
+        return [] if tv_muted else ["VolumeMute"]
+    if pct == 0 and tv_vol == 0:
+        return []  # silent either way
+    delta = pct - tv_vol
+    keys = []
+    if delta:
+        n = max(1, min(100, int(round(abs(delta) / max(step, 1.0)))))
+        keys = ["VolumeUp" if delta > 0 else "VolumeDown"] * n
+    if tv_muted and delta <= 0 and pct > 0:
+        # Unmute last: VolumeDown keeps the mute, so the TV never comes on loud
+        # and ramps down audibly. (pct == 0: reaching 0 leaves it silent anyway.)
+        keys.append("VolumeMute")
+    return keys
+
+
+class PwNode:
+    __slots__ = ("id", "props", "level")
+
+    def __init__(self, node_id, props, level):
+        self.id, self.props, self.level = node_id, props, level  # level: (pct, muted) or None
+
+    @property
+    def name(self):
+        return str(self.props.get("node.name", ""))
+
+
+def find_roku_alsa_sink(nodes):
+    """The ALSA sink that feeds the Roku: the TV's EDID name reaches ALSA as the
+    ELD monitor name, which PipeWire exposes as node.nick / alsa.name."""
+    for node in nodes.values():
+        p = node.props
+        if p.get("media.class") == "Audio/Sink" and p.get("device.api") == "alsa":
+            if "roku" in f"{p.get('node.nick', '')} {p.get('alsa.name', '')}".lower():
+                return node
+    return None
+
+
+class PwGraph:
+    """What `pw-dump` tells us about the audio graph, fed one JSON array at a
+    time (the initial dump, then one array per change batch).
+
+    apply() returns events: ("sink", present) for PW_SINK, ("volume", pct,
+    muted) when its slider moved, ("hdmi", id, pct, muted) when the relay's
+    target (the real HDMI sink) appeared or changed level, ("default", name)
+    when the default output changed.
+    """
+
+    def __init__(self):
+        self.nodes = {}          # id -> PwNode, audio nodes and streams only
+        self.default = None      # node.name of default.audio.sink; "" if none; None if unknown
+        self.relay_target = None  # node.name the relay plays into (from its target.object)
+
+    def by_name(self, name):
+        for node in self.nodes.values():
+            if node.name == name:
+                return node
+        return None
+
+    @property
+    def sink(self):
+        return self.by_name(PW_SINK)
+
+    @property
+    def tv_sink(self):
+        if self.relay_target:
+            return self.by_name(self.relay_target)
+        return find_roku_alsa_sink(self.nodes)
+
+    def apply(self, objs):
+        events, changed = [], set()
+        for o in objs:
+            if not isinstance(o, dict):
+                continue
+            oid, info, otype = o.get("id"), o.get("info"), str(o.get("type", ""))
+            if "info" in o and info is None:  # removal: {"id": N, "info": null}
+                node = self.nodes.pop(oid, None)
+                if node is not None and node.name == PW_SINK:
+                    events.append(("sink", False))
+                continue
+            if otype == "PipeWire:Interface:Metadata":  # has top-level props/metadata, no info
+                # Change batches carry only the changed entries: merge, never replace.
+                if (o.get("props") or {}).get("metadata.name") == "default":
+                    for entry in o.get("metadata") or []:
+                        if entry.get("key") == "default.audio.sink":
+                            value = entry.get("value")
+                            name = str(value.get("name", "")) if isinstance(value, dict) else ""
+                            if name != self.default:
+                                self.default = name
+                                events.append(("default", name))
+                continue
+            if otype != "PipeWire:Interface:Node" or not isinstance(info, dict):
+                continue
+            props = info.get("props") or {}
+            if "Audio" not in str(props.get("media.class", "")):
+                continue
+            params = (info.get("params") or {}).get("Props") or []
+            level = pw_percent(params[0]) if params and isinstance(params[0], dict) else None
+            old = self.nodes.get(oid)
+            if level is None and old is not None:
+                level = old.level
+            node = PwNode(oid, props, level)
+            self.nodes[oid] = node
+            if node.name == PW_RELAY_PLAYBACK and props.get("target.object"):
+                self.relay_target = str(props["target.object"])
+            if node.name == PW_SINK:
+                if old is None:
+                    events.append(("sink", True))
+                elif level is not None and level != old.level:
+                    events.append(("volume",) + level)
+            elif level is not None and (old is None or level != old.level):
+                changed.add(oid)
+        tv = self.tv_sink
+        if tv is not None and tv.id in changed and tv.level is not None:
+            events.append(("hdmi", tv.id) + tv.level)
+        return events
+
+
+# Subprocess seams. The only non-Python tools the project uses; both ship with
+# PipeWire/WirePlumber on every desktop distro. Tests replace these.
+
+def _pw_dump_proc():
+    """Long-lived `pw-dump -m`: the whole state as one JSON array, then one
+    array per change. Line-buffered, '[' and ']' alone on a line."""
+    return subprocess.Popen(["pw-dump", "-m", "-N"], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, encoding="utf-8", errors="replace")
+
+
+def _pw_dump_once():
+    """The graph right now (for `status` and a start-up check), or None."""
+    try:
+        out = subprocess.run(["pw-dump", "-N"], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=5, check=True).stdout
+        objs = json.loads(out)
+        return objs if isinstance(objs, list) else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+_warned = set()
+
+
+def _warn_once(key, msg, *args):
+    if key not in _warned:
+        _warned.add(key)
+        log.warning(msg, *args)
+
+
+def _wpctl(*args, timeout=5):
+    """wpctl set-volume / set-mute / set-default. False if it is missing or failed."""
+    argv = ["wpctl", *map(str, args)]
+    try:
+        subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=True)
+        return True
+    except FileNotFoundError:
+        _warn_once("wpctl", "wpctl not found (apt install wireplumber) - cannot move the PC's volume slider")
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("%s failed: %s", " ".join(argv), e)
+    return False
+
+
+class VolumeWatcher(threading.Thread):
+    """Follows the "Roku TV" output in PipeWire: slider moves go to the
+    reconciler (PC -> TV); set_pc() moves the slider (TV -> PC). Also keeps the
+    graph in the shape the mirror needs: PW_SINK is the default output unless
+    the user picked something else, and the HDMI sink stays at 100%.
+    """
+
+    def __init__(self, reconciler, stop_event):
+        super().__init__(daemon=True, name="volume")
+        self.reconciler = reconciler
+        self.stop_event = stop_event
+        self.graph = PwGraph()
+        self.proc = None
+        self.lock = threading.Lock()
+        self._stop = threading.Event()  # stop() was called: no respawn, no more jobs
+        self._sink_id = None    # PW_SINK's id and level, published for the reconciler thread
+        self._level = None      # (pct, muted) as last seen on PW_SINK
+        self._expect = None     # (pct, muted, old_pct, deadline): the echo of our own set_pc()
+        self._seen_dump = False
+        self._hdmi_fixed = None  # id of the HDMI sink we last reset; never fight twice
+        self._default_asked = None  # id of PW_SINK we last made default; ask once per appearance
+
+    # -- TV -> PC (called on the reconciler thread) ----------------------------
+
+    def set_pc(self, pct, muted):
+        sink_id, level = self._sink_id, self._level  # published by the watcher thread; never walk the graph here
+        if sink_id is None:
+            log.debug("no '%s' output in PipeWire - cannot set the PC volume", PW_SINK)
+            return False
+        if level == (pct, muted):
+            return True  # nothing to write, so no echo to expect either
+        with self.lock:
+            self._expect = (pct, muted, level[0] if level else pct, time.monotonic() + 2.0)
+        # Short timeouts: this runs on the reconciler thread, which the urgent
+        # "TV off" path also needs; wpctl normally answers in milliseconds.
+        ok = _wpctl("set-mute", sink_id, "1" if muted else "0", timeout=1.0)
+        ok = _wpctl("set-volume", sink_id, f"{pct / 100:.2f}", timeout=1.0) and ok  # wpctl takes the cubic value
+        if not ok:
+            with self.lock:
+                self._expect = None
+        return ok
+
+    def _is_echo(self, pct, muted):
+        """Our own set_pc() comes back as events: first (old pct, new mute) after
+        set-mute, then the final value. Anything else is the user."""
+        with self.lock:
+            exp = self._expect
+            if exp is None:
+                return False
+            want_pct, want_muted, old_pct, deadline = exp
+            if (pct, muted) == (want_pct, want_muted):
+                self._expect = None
+                return True
+            if (pct, muted) == (old_pct, want_muted) and time.monotonic() < deadline:
+                return True
+            self._expect = None
+            return False
+
+    # -- PipeWire -> graph -> events -------------------------------------------
+
+    def _stopping(self):
+        return self._stop.is_set() or self.stop_event.is_set()
+
+    def run(self):
+        attempt = 0
+        while not self._stopping():
+            try:
+                self.proc = _pw_dump_proc()
+            except OSError as e:
+                log.warning("pw-dump not available (%s): install pipewire-bin. Volume mirror off.", e)
+                return
+            started = time.monotonic()
+            self.graph = PwGraph()
+            self._sink_id = self._level = self._hdmi_fixed = self._default_asked = None
+            self._seen_dump = False
+            try:
+                self._follow(self.proc)
+            except Exception:
+                log.exception("volume watcher failed - reconnecting")
+            # systemd stops the whole cgroup at once, so at shutdown the child dies
+            # a moment before our own SIGTERM handler runs: give it that moment.
+            if self._stop.wait(1.0) or self._stopping():
+                return
+            if time.monotonic() - started > 60:
+                attempt = 0  # it ran for a while: PipeWire restarted, nothing is broken
+            if attempt == 0:
+                log.warning("pw-dump exited (PipeWire restarting?) - reconnecting")
+            delay = PW_DUMP_LADDER[min(attempt, len(PW_DUMP_LADDER) - 1)]
+            log.debug("pw-dump retry %d in %ss", attempt + 1, delay)
+            attempt += 1
+            self._stop.wait(delay)
+
+    def _follow(self, proc):
+        lines = []
+        try:
+            for line in proc.stdout:
+                if self._stopping():
+                    break
+                lines.append(line)
+                if line.rstrip("\r\n") == "]":  # nested arrays are indented; this ends a batch
+                    self._batch("".join(lines))
+                    lines = []
+        finally:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+            proc.wait()
+
+    def _batch(self, text):
+        try:
+            objs = json.loads(text)
+        except ValueError as e:
+            log.debug("unparseable pw-dump batch (%d bytes): %s", len(text), e)
+            return
+        if not isinstance(objs, list):
+            return
+        try:
+            self._events(self.graph.apply(objs))
+        except Exception:
+            log.exception("pw-dump batch dropped")  # one odd object must not kill the mirror
+            return
+        # The first batch with real objects is the initial dump (a removal can
+        # precede it); only then does "no roku-tv" mean the drop-in is missing.
+        if not self._seen_dump and any(isinstance(o, dict) and "type" in o for o in objs):
+            self._seen_dump = True
+            if self.graph.sink is None:
+                log.warning("ROKU_VOLUME=true but PipeWire has no '%s' output - run ./install.sh --volume "
+                            "(the TV's volume will not follow the PC until then)", PW_SINK)
+
+    def _events(self, events):
+        for ev in events:
+            kind = ev[0]
+            if kind == "sink":
+                if ev[1]:
+                    sink = self.graph.sink
+                    self._level, self._sink_id = sink.level, sink.id
+                    log.info("following the '%s' output in PipeWire", PW_SINK)
+                    self.reconciler.request_volume(SYNC)  # TV wins when the output (re)appears
+                    self._ensure_default()
+                else:
+                    self._sink_id = self._level = None
+                    log.info("the '%s' output is gone (PipeWire restarting?)", PW_SINK)
+            elif kind == "volume":
+                self._level = (ev[1], ev[2])
+                if not self._is_echo(ev[1], ev[2]):
+                    self.reconciler.request_volume((ev[1], ev[2]))
+            elif kind == "default":
+                self._ensure_default()
+                tv = self.graph.tv_sink
+                if self.graph.default == PW_SINK and tv is not None and tv.level is not None:
+                    self._keep_unity(tv.id, *tv.level)  # we just became default: check the HDMI level now
+            elif kind == "hdmi":
+                self._keep_unity(ev[1], ev[2], ev[3])
+
+    def _ensure_default(self):
+        """Make PW_SINK the default output, but only to replace the raw HDMI sink
+        (or no default at all): a headset the user picked stays picked."""
+        g = self.graph
+        sink = g.sink
+        if sink is None or g.default is None or self._default_asked == sink.id:
+            return
+        if g.default == PW_SINK:
+            self._default_asked = sink.id  # it is ours; from now on a change is the user's choice
+            return
+        tv = g.tv_sink
+        if g.default == "" or (tv is not None and g.default == tv.name):
+            self._default_asked = sink.id
+            if _wpctl("set-default", sink.id):
+                log.info("made '%s' the default output (was %s)", PW_SINK, g.default or "none")
+
+    def _keep_unity(self, node_id, pct, muted):
+        if (pct == 100 and not muted) or self.graph.default != PW_SINK or self._hdmi_fixed == node_id:
+            return
+        self._hdmi_fixed = node_id
+        _wpctl("set-volume", node_id, "1.0")
+        _wpctl("set-mute", node_id, "0")
+        log.info("HDMI output was at %d%%%s - reset to 100%% (the TV does the attenuating)",
+                 pct, " muted" if muted else "")
+
+    def stop(self):
+        self._stop.set()
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Reconciler: one worker thread owns all TV I/O; bounded retries, never loops
 # ---------------------------------------------------------------------------
 
@@ -1053,7 +1488,7 @@ ON_LADDER = (0, 3, 8, 15, 30, 60)  # seconds between attempts; covers Wi-Fi comi
 
 
 class Reconciler(threading.Thread):
-    def __init__(self, roku, cfg):
+    def __init__(self, roku, cfg, pc_volume=None):
         super().__init__(daemon=True, name="reconciler")
         self.roku, self.cfg = roku, cfg
         self.cv = threading.Condition()
@@ -1064,6 +1499,14 @@ class Reconciler(threading.Thread):
         self.done.set()
         self.last_off_at = None
         self.fatal = None  # exit code the main loop should use (WrongDevice)
+        # Volume mirror (Linux): a second latest-wins slot. Power always goes
+        # first; a volume job checks `stale` between keys and yields to both a
+        # newer slider value and a power edge.
+        self.volume = None       # (pct, muted) or SYNC
+        self.vgen = 0
+        self.tv_on = False       # the last ensure_on() succeeded: on and on our input
+        self.pc_volume = pc_volume  # callable(pct, muted) -> bool that sets the PC slider
+        self._vol_skip = None    # why the last PC -> TV job was dropped (logged once per streak)
 
     def request(self, target, urgent=False):
         with self.cv:
@@ -1072,16 +1515,35 @@ class Reconciler(threading.Thread):
             self.done.clear()
             self.cv.notify()
 
+    def request_volume(self, want):
+        """Key repeat collapses to the newest value; an in-flight burst notices
+        it is stale. Never touches `done`: that belongs to the power path."""
+        with self.cv:
+            self.volume = want
+            self.vgen += 1
+            self.cv.notify()
+
     def wait_done(self, timeout):
         return self.done.wait(timeout)
 
     def run(self):
         while True:
             with self.cv:
-                while self.target is None:
+                while self.target is None and self.volume is None:
                     self.cv.wait()
-                target, urgent, gen = self.target, self.urgent, self.gen
-                self.target = None
+                if self.target is not None:
+                    target, urgent, gen = self.target, self.urgent, self.gen
+                    self.target = None
+                    want = None
+                else:
+                    want, vgen, gen = self.volume, self.vgen, self.gen
+                    self.volume = None
+            if want is not None:
+                try:
+                    self._reconcile_volume(want, lambda: self.gen != gen or self.vgen != vgen)
+                except Exception:
+                    log.exception("volume job %s failed", want)
+                continue
             try:
                 self._reconcile(target, urgent, lambda: self.gen != gen)
             except WrongDevice as e:
@@ -1095,6 +1557,7 @@ class Reconciler(threading.Thread):
 
     def _reconcile(self, target, urgent, stale):
         if target == OFF:
+            self.tv_on = False
             if urgent:
                 if ensure_off(self.roku, self.cfg, stale, urgent=True):
                     self.last_off_at = time.monotonic()
@@ -1111,10 +1574,80 @@ class Reconciler(threading.Thread):
             if stale():
                 return
             if ensure_on(self.roku, self.cfg, stale):
+                self.tv_on = True
+                if self.pc_volume is not None:
+                    self.request_volume(SYNC)  # TV wins at power-on: the slider adopts the TV
                 return
             log.info("retrying TV on in a moment")
         log.warning("giving up on TV on until the displays change again - "
                     "is the TV powered, on the network, with 'Fast TV start' enabled?")
+
+    # -- volume mirror ----------------------------------------------------------
+
+    def _skip(self, why):
+        if why != self._vol_skip:
+            log.info("%s", why)
+            self._vol_skip = why
+
+    def _reconcile_volume(self, want, stale):
+        """One slider value -> the TV (or SYNC: the TV -> the slider). One attempt,
+        short timeouts, bounded rounds; on any trouble log and wait for the next
+        change or edge. Never loops at a TV that will not answer."""
+        if self.pc_volume is None:
+            return
+        roku, t, cfg = self.roku, VOLUME_TIMEOUT_S, self.cfg
+        if want == SYNC:
+            try:
+                tv_vol, tv_muted = roku.audio_device(timeout=t)
+            except EcpError as e:
+                log.info("cannot read the TV's volume (%s) - the PC slider keeps its value", e)
+                return
+            if stale():
+                return  # the user moved the slider meanwhile (or a power edge): that wins
+            if self.pc_volume(tv_vol, tv_muted):
+                log.info("PC volume set to the TV's: %d%%%s", tv_vol, " (muted)" if tv_muted else "")
+            return
+        pct, muted = want
+        if not self.tv_on:
+            self._skip("TV is not on (as far as we know) - PC volume changes are not sent")
+            return
+        try:
+            app_id, name = roku.active_app(timeout=t)
+            if app_id != cfg.input_app:
+                self._skip(f"TV is showing '{name}', not {cfg.input_name.upper()} - leaving its volume alone")
+                return
+            tv_vol, tv_muted = roku.audio_device(timeout=t)
+            start, step = (tv_vol, tv_muted), 1.0
+            for _ in range(VOLUME_ROUNDS):
+                keys = plan_volume_keys(tv_vol, tv_muted, pct, muted, step)
+                if not keys:
+                    break
+                before, sent = tv_vol, sum(k != "VolumeMute" for k in keys)
+                for key in keys:
+                    if stale():
+                        return  # a newer value or a power edge: that job takes over
+                    if roku.keypress(key, timeout=t) == 202:
+                        self._skip("TV accepted but ignored a volume key (standby?) - PC volume changes are not sent")
+                        return
+                    if VOLUME_KEY_GAP_S:
+                        time.sleep(VOLUME_KEY_GAP_S)
+                    log.debug("sent %s", key)
+                if not _sleep_unless(VOLUME_SETTLE_S, stale):
+                    return
+                tv_vol, tv_muted = roku.audio_device(timeout=t)
+                if sent and abs(tv_vol - before) > sent:
+                    step = abs(tv_vol - before) / sent  # a TV that moves more than one per key
+        except EcpError as e:
+            self._skip(f"TV volume not delivered ({_describe_power_mode_failure(e)}) - "
+                       "will retry at the next change")
+            return
+        self._vol_skip = None
+        if plan_volume_keys(tv_vol, tv_muted, pct, muted):
+            log.warning("TV volume settled at %d%s, wanted %d%s - giving up until the next change",
+                        tv_vol, " muted" if tv_muted else "", pct, " muted" if muted else "")
+        elif (tv_vol, tv_muted) != start:
+            log.info("TV volume %d%s -> %d%s", start[0], " muted" if start[1] else "",
+                     tv_vol, " muted" if tv_muted else "")
 
 
 # ---------------------------------------------------------------------------
@@ -1122,8 +1655,9 @@ class Reconciler(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class Daemon:
-    def __init__(self, cfg, sampler, reconciler):
+    def __init__(self, cfg, sampler, reconciler, volume=None):
         self.cfg, self.sampler, self.reconciler = cfg, sampler, reconciler
+        self.volume = volume       # VolumeWatcher (Linux, ROKU_VOLUME=true) or None
         self.committed = None      # what we last asked the TV to be
         self.off_samples = 0
         self.off_deadline = None
@@ -1208,6 +1742,8 @@ class Daemon:
             log.info("%s: TV off still in flight after %.1fs, continuing", why, URGENT_OFF_BUDGET)
 
     def on_term(self):
+        if self.volume is not None:
+            self.volume.stop()  # first: no volume job belongs in a shutdown
         if not self.stop_event.is_set():
             if self.shutdown_seen:
                 log.info("SIGTERM during shutdown - already handled")
@@ -1219,10 +1755,14 @@ class Daemon:
 
     def on_int(self):
         log.info("interrupted - leaving the TV as it is")
+        if self.volume is not None:
+            self.volume.stop()
         self._quit()
 
     def _quit(self):
         self.stop_event.set()
+        if self.volume is not None:
+            self.volume.stop()
         if self.loop is not None:
             self.loop.quit()
 
@@ -1291,6 +1831,8 @@ class Daemon:
 
     def run(self):
         self.reconciler.start()
+        if self.volume is not None:
+            self.volume.start()
         self._initial()
         if IS_WIN:
             return run_windows_loop(self)
@@ -1454,6 +1996,7 @@ def cmd_status(args, cfg):
             tag = "  <- Roku" if c.name == s.roku_name else ""
             print(f"  {c.name:<18} {c.status:<13} {c.enabled:<9} {c.dpms:<4} {'driven' if c.driven else ''}{tag}")
         print(f"Roku connector: {s.roku_name or 'not found (set ROKU_CONNECTOR)'} -> {s.roku}")
+        _print_audio_status()
     if not cfg.tv_ip:
         print("TV: ROKU_TV_IP not set")
         return 1
@@ -1471,7 +2014,45 @@ def cmd_status(args, cfg):
     print(f"Wanted input: {cfg.input_name.upper()} ({cfg.input_app}); "
           f"mirror rule: displays on -> TV on+{cfg.input_name.upper()}, displays off -> TV off"
           f"{' (only if on our input)' if cfg.only_off_when_on_input else ''}")
+    if not IS_WIN:
+        try:
+            vol, muted = roku.audio_device()
+            print(f"TV volume: {vol}{' (muted)' if muted else ''}; "
+                  f"volume mirror (ROKU_VOLUME): {'on' if cfg.volume else 'off'}")
+        except EcpError as e:
+            print(f"TV volume: not readable ({e}) - the volume mirror needs /query/audio-device")
     return 0
+
+
+def _level(node):
+    if node.level is None:
+        return "level unknown"
+    return f"{node.level[0]}%{' muted' if node.level[1] else ''}"
+
+
+def _print_audio_status():
+    """Linux: the PipeWire side of the volume mirror. install.sh reads the first
+    line to learn which sink feeds the TV, so its shape is fixed."""
+    objs = _pw_dump_once()
+    if objs is None:
+        print("Audio: PipeWire not reachable (pw-dump missing or not in a desktop session)")
+        return
+    g = PwGraph()
+    g.apply(objs)
+    tv = g.tv_sink or find_roku_alsa_sink(g.nodes)  # by the relay's target, else by the Roku's name
+    if tv is not None:
+        print(f"Audio sink to TV: {tv.name} ({_level(tv)})")
+        if g.relay_target and g.relay_target != tv.name:
+            print(f"  but the relay plays into '{g.relay_target}', which is not present - "
+                  "re-run ./install.sh --volume to point it at the sink above")
+    else:
+        print("Audio sink to TV: (not found - the HDMI sink appears with the TV's hot-plug; is the TV on?)")
+    sink = g.sink
+    if sink is not None:
+        print(f"'Roku TV' output ({PW_SINK}): present, {_level(sink)}; default output: {g.default or 'none'}"
+              f"{'' if g.default == PW_SINK else ' (not the Roku TV output - volume keys do not reach the TV)'}")
+    else:
+        print(f"'Roku TV' output ({PW_SINK}): absent - volume mirror not installed (./install.sh --volume)")
 
 
 def cmd_on(args, cfg):
@@ -1489,8 +2070,28 @@ def cmd_off(args, cfg):
 def cmd_run(args, cfg):
     cfg.require_tv()
     roku = Roku(cfg.tv_ip, cfg.ecp_timeout, cfg.serial)
-    daemon = Daemon(cfg, make_sampler(cfg), Reconciler(roku, cfg))
-    return daemon.run()
+    reconciler = Reconciler(roku, cfg)
+    daemon = Daemon(cfg, make_sampler(cfg), reconciler)
+    if cfg.volume and IS_WIN:
+        log.warning("ROKU_VOLUME=true is Linux-only (PipeWire) - ignored on Windows")
+    elif cfg.volume:
+        daemon.volume = VolumeWatcher(reconciler, daemon.stop_event)
+        reconciler.pc_volume = daemon.volume.set_pc
+    elif not IS_WIN:
+        objs = _pw_dump_once()
+        if objs is not None:
+            g = PwGraph()
+            g.apply(objs)
+            if g.sink is not None:
+                log.warning("PipeWire has a '%s' output but ROKU_VOLUME=false: its volume slider moves "
+                            "nothing. Set ROKU_VOLUME=true, or remove "
+                            "~/.config/pipewire/pipewire.conf.d/90-roku-monitor.conf and restart pipewire.",
+                            PW_SINK)
+    try:
+        return daemon.run()
+    finally:
+        if daemon.volume is not None:
+            daemon.volume.stop()
 
 
 def main(argv=None):

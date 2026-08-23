@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Install roku-monitor as a systemd --user service for the current user.
-#   ./install.sh [--copy] [--no-discover] [--no-enable]
+#   ./install.sh [--copy] [--no-discover] [--no-enable] [--volume]
 # --copy        copy the script into ~/.local/bin instead of symlinking the clone
 # --no-discover skip the interactive "which TV?" step
 # --no-enable   install files only; do not enable/start the service
+# --volume      also make the PC's volume control drive the TV's volume: adds a
+#               PipeWire "Roku TV" output (drop-in, restarts PipeWire once) and
+#               sets ROKU_VOLUME=true. Needs pw-dump/wpctl and the TV on.
 # No sudo is used anywhere; everything lands under $HOME.
 set -euo pipefail
 
@@ -13,14 +16,17 @@ BIN_DIR=${XDG_BIN_HOME:-$HOME/.local/bin}
 CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/$APP
 UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 CONF="$CONF_DIR/env"
-COPY=0 DISCOVER=1 ENABLE=1
+PW_CONF_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/pipewire/pipewire.conf.d
+PW_CONF="$PW_CONF_DIR/90-$APP.conf"
+COPY=0 DISCOVER=1 ENABLE=1 VOLUME=0
 
 for arg in "$@"; do
   case "$arg" in
     --copy) COPY=1 ;;
     --no-discover) DISCOVER=0 ;;
     --no-enable) ENABLE=0 ;;
-    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    --volume) VOLUME=1 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -38,6 +44,9 @@ fi
 command -v systemctl >/dev/null || die "systemctl not found; this installer needs systemd --user"
 systemctl --user show-environment >/dev/null 2>&1 || die "systemd --user is not reachable. Run this from a desktop session (not plain SSH)."
 [ -d /sys/class/drm ] || die "/sys/class/drm is missing; this needs a Linux DRM/KMS graphics driver"
+if [ "$VOLUME" = 1 ] && { ! command -v pw-dump >/dev/null || ! command -v wpctl >/dev/null; }; then
+  die "--volume needs PipeWire and WirePlumber (pw-dump, wpctl): sudo apt install pipewire-bin wireplumber"
+fi
 # capture first: status exits 1 when no TV is configured yet, which must not trip pipefail here
 status_out=$(/usr/bin/python3 "$REPO_DIR/roku_monitor.py" status 2>/dev/null || true)
 if ! grep -q '<- Roku' <<<"$status_out"; then
@@ -130,7 +139,49 @@ if [ "$DISCOVER" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
   fi
 fi
 
+# --- volume mirror (optional) --------------------------------------------------
+# A PipeWire drop-in adds a "Roku TV" output whose slider the daemon mirrors to
+# the TV; the relay inside it must name the HDMI sink that feeds the TV, which
+# `status` prints while that sink exists (the TV on, or in Fast-start standby).
+pw_changed=0 conf_changed=0
+if [ "$VOLUME" = 1 ]; then
+  # status prints "Audio sink to TV: <node.name> (<level>)"; the not-found shape
+  # starts its text with "(" so it can never be mistaken for a name.
+  sink=$(sed -n 's/^Audio sink to TV: \([A-Za-z0-9._-]\{1,\}\) (.*/\1/p' <<<"$status_out" | head -1)
+  if [ -z "$sink" ] && [ -t 0 ] && [ -t 1 ]; then
+    warn "no audio sink named after the Roku is present right now (it appears while the TV asserts HDMI hot-plug)."
+    printf "PipeWire node.name of the HDMI output that feeds the TV (see: wpctl status -n), or blank to skip: "
+    read -r sink
+  fi
+  if [ -z "$sink" ]; then
+    warn "volume mirror not installed. Turn the TV on and re-run: ./install.sh --volume"
+  else
+    [[ "$sink" =~ ^[A-Za-z0-9._-]+$ ]] || die "unexpected sink name: $sink"
+    mkdir -p "$PW_CONF_DIR"
+    tmp=$(mktemp "$PW_CONF_DIR/.90-$APP.XXXXXX")
+    sed "s|@ROKU_SINK@|$sink|" "$REPO_DIR/$APP.pipewire.conf" >"$tmp"
+    if [ -f "$PW_CONF" ] && cmp -s "$tmp" "$PW_CONF"; then
+      rm -f "$tmp"
+    else
+      mv "$tmp" "$PW_CONF"; pw_changed=1
+    fi
+    # PipeWire reads every drop-in at start and a broken one can mean no sound at
+    # all, so make sure the merged config still parses and contains our output.
+    if command -v pw-config >/dev/null && ! pw-config -N -r merge context.objects 2>/dev/null | grep -q '"roku-tv"'; then
+      rm -f "$PW_CONF"
+      die "PipeWire did not accept $PW_CONF (removed again). Please report the output of: pw-config -N -r merge context.objects"
+    fi
+    if ! grep -q '^ROKU_VOLUME=true$' "$CONF"; then set_conf ROKU_VOLUME true; conf_changed=1; fi
+    say "wrote $PW_CONF (relay into $sink) and ROKU_VOLUME=true"
+    if [ "$pw_changed" = 1 ]; then
+      warn "restarting PipeWire to load it (sound pauses for a second)"
+      systemctl --user restart pipewire.service || warn "could not restart PipeWire; log out and in again to load it"
+    fi
+  fi
+fi
+
 # --- service -----------------------------------------------------------------
+was_active=0; systemctl --user is-active --quiet "$APP.service" && was_active=1
 systemctl --user daemon-reload
 if command -v systemd-analyze >/dev/null; then
   # verify loads every unit it can see; only our own unit's complaints matter
@@ -138,6 +189,10 @@ if command -v systemd-analyze >/dev/null; then
 fi
 if [ "$ENABLE" = 1 ]; then
   systemctl --user enable --now "$APP.service"
+  if [ "$was_active" = 1 ] && { [ "$pw_changed" = 1 ] || [ "$conf_changed" = 1 ]; }; then
+    # a running daemon only reads its config at start (expect the TV to blink off/on)
+    systemctl --user restart "$APP.service"
+  fi
   sleep 1
   systemctl --user --no-pager --lines=8 status "$APP.service" || true
 else
@@ -146,5 +201,8 @@ fi
 
 say "done."
 echo "  config:  $CONF"
+if [ "$VOLUME" = 1 ] && [ -f "$PW_CONF" ]; then
+  echo "  volume:  $PW_CONF (the 'Roku TV' output; the daemon makes it the default)"
+fi
 echo "  logs:    journalctl --user -u $APP -f"
 echo "  status:  $APP status"

@@ -1,6 +1,8 @@
 """Unit tests for the pure helpers. No network, no gi, no real sysfs —
 everything CI can actually prove about the logic."""
 
+import io
+import json
 import os
 import re
 import sys
@@ -469,6 +471,493 @@ class ConfigPathTests(unittest.TestCase):
 
     def test_posix_config_path(self):
         self.assertTrue(rm.default_config_path().endswith(os.path.join(rm.APP, "env")))
+
+
+# ---------------------------------------------------------------------------
+# Volume mirror (Linux): pure helpers, the pw-dump parser, the reconciler's
+# volume job and the watcher's handlers. No subprocess is ever spawned here.
+# ---------------------------------------------------------------------------
+
+AUDIO_DEVICE_XML = """<?xml version="1.0" encoding="UTF-8" ?>
+<audio-device>
+  <capabilities><all-destinations>speakers,spdif</all-destinations></capabilities>
+  <global>
+    <muted>{muted}</muted>
+    <volume>{volume}</volume>
+    <destination-list>speakers,spdif,lineout</destination-list>
+  </global>
+  <destinations><destination name="speakers"><muted>false</muted><volume>15</volume></destination></destinations>
+</audio-device>"""
+
+
+def pw_node(node_id, name, media_class="Audio/Sink", volumes=(1.0, 1.0), mute=False, **props):
+    p = {"node.name": name, "media.class": media_class}
+    p.update(props)
+    return {"id": node_id, "type": "PipeWire:Interface:Node",
+            "info": {"props": p, "params": {"Props": [{"volume": 1.0, "mute": mute,
+                                                     "channelVolumes": list(volumes)}]}}}
+
+
+def pw_default(name):
+    return {"id": 41, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
+            "metadata": [{"subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON",
+                          "value": {"name": name}}]}
+
+
+HDMI = "alsa_output.pci-0000_00_00.1.hdmi-stereo-extra1"
+
+
+def pw_graph_objs(default=HDMI, with_sink=True, sink_volumes=(0.003375, 0.003375)):
+    objs = [pw_node(80, HDMI, device_api="alsa", **{"node.nick": "Roku TV"}),
+            pw_node(47, rm.PW_RELAY_PLAYBACK, "Stream/Output/Audio", **{"target.object": HDMI}),
+            pw_node(79, rm.PW_RELAY_CAPTURE, "Stream/Input/Audio", **{"target.object": rm.PW_SINK}),
+            pw_default(default)]
+    if with_sink:
+        objs.append(pw_node(85, rm.PW_SINK, volumes=sink_volumes))
+    for o in objs:
+        if "device_api" in (o.get("info") or {}).get("props", {}):
+            o["info"]["props"]["device.api"] = o["info"]["props"].pop("device_api")
+    return objs
+
+
+class VolumeMappingTests(unittest.TestCase):
+    def test_cubic_percent(self):
+        self.assertEqual(rm.pw_percent({"channelVolumes": [1.0, 1.0]}), (100, False))
+        self.assertEqual(rm.pw_percent({"channelVolumes": [0.125, 0.125]}), (50, False))
+        self.assertEqual(rm.pw_percent({"channelVolumes": [0.064, 0.064], "mute": True}), (40, True))
+        self.assertEqual(rm.pw_percent({"channelVolumes": [0.003375, 0.001]}), (15, False))  # max channel
+        self.assertEqual(rm.pw_percent({"channelVolumes": [0.0, 0.0]}), (0, False))
+        self.assertEqual(rm.pw_percent({"volume": 0.125}), (50, False))  # no channels: fall back
+        self.assertEqual(rm.pw_percent({"channelVolumes": [2.0]}), (100, False))  # clamped
+
+    def test_round_trip_every_percent(self):
+        # wpctl takes the cubic value; what we write must read back as the same percent
+        for pct in range(101):
+            linear = (pct / 100) ** 3
+            self.assertEqual(rm.pw_percent({"channelVolumes": [linear, linear]})[0], pct)
+
+
+class AudioDeviceParseTests(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(rm.parse_audio_device(AUDIO_DEVICE_XML.format(muted="false", volume="15")), (15, False))
+        self.assertEqual(rm.parse_audio_device(AUDIO_DEVICE_XML.format(muted="true", volume="0")), (0, True))
+        self.assertEqual(rm.parse_audio_device(AUDIO_DEVICE_XML.format(muted="false", volume="140")), (100, False))
+
+    def test_missing_is_ecp_error(self):
+        with self.assertRaises(rm.EcpError):
+            rm.parse_audio_device("<audio-device><capabilities/></audio-device>")
+        with self.assertRaises(rm.EcpError):
+            rm.parse_audio_device(AUDIO_DEVICE_XML.format(muted="false", volume="loud"))
+        with self.assertRaises(rm.EcpError):
+            rm.parse_audio_device("not xml")
+
+
+class VolumePlanTests(unittest.TestCase):
+    def test_steps(self):
+        self.assertEqual(rm.plan_volume_keys(15, False, 40, False), ["VolumeUp"] * 25)
+        self.assertEqual(rm.plan_volume_keys(40, False, 15, False), ["VolumeDown"] * 25)
+        self.assertEqual(rm.plan_volume_keys(15, False, 15, False), [])
+        self.assertEqual(len(rm.plan_volume_keys(0, False, 100, False)), 100)
+
+    def test_mute_rules(self):
+        # PC muted: only the mute is mirrored, the volume follows at unmute
+        self.assertEqual(rm.plan_volume_keys(15, False, 40, True), ["VolumeMute"])
+        self.assertEqual(rm.plan_volume_keys(15, True, 40, True), [])
+        # PC unmuted, TV muted: going up needs no toggle (VolumeUp unmutes) ...
+        self.assertEqual(rm.plan_volume_keys(0, True, 6, False), ["VolumeUp"] * 6)
+        self.assertEqual(rm.plan_volume_keys(15, True, 21, False), ["VolumeUp"] * 6)
+        # ... staying needs the toggle, going down steps first (VolumeDown keeps a muted
+        # TV muted) and unmutes last, so the TV never comes on loud and ramps down
+        self.assertEqual(rm.plan_volume_keys(15, True, 15, False), ["VolumeMute"])
+        self.assertEqual(rm.plan_volume_keys(15, True, 10, False), ["VolumeDown"] * 5 + ["VolumeMute"])
+        self.assertEqual(rm.plan_volume_keys(15, True, 0, False), ["VolumeDown"] * 15)  # 0 is silent anyway
+        # 0 is silent whatever the mute flag says (the TV mutes itself at 0)
+        self.assertEqual(rm.plan_volume_keys(0, True, 0, False), [])
+        self.assertEqual(rm.plan_volume_keys(0, False, 0, True), ["VolumeMute"])
+
+
+class PwGraphTests(unittest.TestCase):
+    def test_initial_dump(self):
+        g = rm.PwGraph()
+        events = g.apply(pw_graph_objs())
+        self.assertIn(("sink", True), events)
+        self.assertIn(("default", HDMI), events)
+        self.assertIn(("hdmi", 80, 100, False), events)
+        self.assertNotIn(("volume", 15, False), events)  # the initial level is state, not a change
+        self.assertEqual(g.sink.level, (15, False))
+        self.assertEqual(g.relay_target, HDMI)
+        self.assertIs(g.tv_sink, g.nodes[80])
+        self.assertEqual(g.default, HDMI)
+
+    def test_volume_change_and_echo_of_other_params(self):
+        g = rm.PwGraph()
+        g.apply(pw_graph_objs())
+        self.assertEqual(g.apply([pw_node(85, rm.PW_SINK, volumes=(0.064, 0.064))]), [("volume", 40, False)])
+        self.assertEqual(g.apply([pw_node(85, rm.PW_SINK, volumes=(0.064, 0.064))]), [])  # same level: nothing
+        self.assertEqual(g.apply([pw_node(85, rm.PW_SINK, volumes=(0.064, 0.064), mute=True)]),
+                         [("volume", 40, True)])
+        # a re-dump without Props (e.g. a state change) keeps the last level
+        g.apply([{"id": 85, "type": "PipeWire:Interface:Node",
+                  "info": {"props": {"node.name": rm.PW_SINK, "media.class": "Audio/Sink"}}}])
+        self.assertEqual(g.sink.level, (40, True))
+
+    def test_removal_and_return(self):
+        g = rm.PwGraph()
+        g.apply(pw_graph_objs())
+        self.assertEqual(g.apply([{"id": 85, "info": None}]), [("sink", False)])
+        self.assertIsNone(g.sink)
+        self.assertEqual(g.apply([pw_node(85, rm.PW_SINK, volumes=(0.125, 0.125))]), [("sink", True)])
+        # the HDMI sink vanishes at every blank and comes back with a new id
+        g.apply([{"id": 80, "info": None}])
+        self.assertIsNone(g.tv_sink)
+        self.assertEqual(g.apply([pw_node(88, HDMI, volumes=(0.064, 0.064), **{"device.api": "alsa"})]),
+                         [("hdmi", 88, 40, False)])
+
+    def test_metadata_merge_and_default_change(self):
+        g = rm.PwGraph()
+        g.apply(pw_graph_objs())
+        # a change batch carries only the changed entry
+        self.assertEqual(g.apply([pw_default(rm.PW_SINK)]), [("default", rm.PW_SINK)])
+        self.assertEqual(g.apply([{"id": 41, "type": "PipeWire:Interface:Metadata",
+                                   "props": {"metadata.name": "default"},
+                                   "metadata": [{"key": "default.audio.source", "value": {"name": "mic"}}]}]), [])
+        self.assertEqual(g.default, rm.PW_SINK)
+
+    def test_relay_target_learned_late_and_roku_fallback(self):
+        g = rm.PwGraph()
+        g.apply([pw_node(80, HDMI, **{"device.api": "alsa", "alsa.name": "Roku TV"})])
+        self.assertEqual(g.tv_sink.id, 80)  # found by name before the relay is seen
+        g.apply([pw_node(47, rm.PW_RELAY_PLAYBACK, "Stream/Output/Audio", **{"target.object": "other"})])
+        self.assertIsNone(g.tv_sink)  # the relay names a sink that is not there
+        g.apply([pw_node(90, "other", **{"device.api": "alsa"})])
+        self.assertEqual(g.tv_sink.id, 90)
+
+    def test_ignores_non_audio_and_garbage(self):
+        g = rm.PwGraph()
+        self.assertEqual(g.apply([{"id": 1, "type": "PipeWire:Interface:Port", "info": {}},
+                                  pw_node(5, "cam", "Video/Source"), "junk", {"id": 9}]), [])
+        self.assertEqual(g.nodes, {})
+
+
+class FakeProc:
+    def __init__(self, text):
+        self.stdout = io.StringIO(text)
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+
+    def poll(self):
+        return 0
+
+
+class WatcherTests(unittest.TestCase):
+    class FakeReconciler:
+        def __init__(self):
+            self.volumes = []
+
+        def request_volume(self, want):
+            self.volumes.append(want)
+
+    def setUp(self):
+        self.calls = []
+        orig = rm._wpctl
+        setattr(rm, "_wpctl", lambda *a, **k: self.calls.append(tuple(map(str, a))) or True)
+        self.addCleanup(setattr, rm, "_wpctl", orig)
+        self.rec = self.FakeReconciler()
+        self.w = rm.VolumeWatcher(self.rec, rm.threading.Event())
+
+    def feed(self, *batches):
+        proc = FakeProc("".join(json.dumps(b, indent=2) + "\n" for b in batches))
+        self.w._follow(proc)
+        self.assertTrue(proc.waited)
+
+    def test_initial_dump_syncs_and_sets_default(self):
+        self.feed(pw_graph_objs())
+        self.assertEqual(self.rec.volumes, [rm.SYNC])
+        self.assertIn(("set-default", "85"), self.calls)  # default was the raw HDMI sink
+
+    def test_slider_moves_become_jobs_and_echo_is_ignored(self):
+        self.feed(pw_graph_objs(default=rm.PW_SINK))
+        self.assertEqual(self.calls, [])  # nothing to fix
+        self.feed(pw_graph_objs(default=rm.PW_SINK), [pw_node(85, rm.PW_SINK, volumes=(0.064, 0.064))])
+        self.assertEqual(self.rec.volumes[-1], (40, False))
+        # TV -> PC: our own write comes back as an event and must not bounce to the TV
+        n = len(self.rec.volumes)
+        self.assertTrue(self.w.set_pc(21, True))
+        self.assertEqual(self.calls[-2:], [("set-mute", "85", "1"), ("set-volume", "85", "0.21")])
+        self.w._events([("volume", 40, True)])   # intermediate: set-mute landed first
+        self.w._events([("volume", 21, True)])   # the value we wrote
+        self.assertEqual(len(self.rec.volumes), n)
+        self.w._events([("volume", 27, True)])   # a real move afterwards
+        self.assertEqual(self.rec.volumes[-1], (27, True))
+
+    def test_noop_sync_does_not_swallow_the_next_key(self):
+        self.feed(pw_graph_objs(default=rm.PW_SINK))  # slider at 15, unmuted
+        n = len(self.calls)
+        self.assertTrue(self.w.set_pc(15, False))   # TV says 15 too: nothing to write
+        self.assertEqual(len(self.calls), n)
+        self.w._events([("volume", 16, False)])    # Vol+ right after: must reach the TV
+        self.assertEqual(self.rec.volumes[-1], (16, False))
+        # an unrelated value during an armed echo is the user, not an intermediate
+        self.w.set_pc(40, True)
+        self.w._events([("volume", 33, False)])
+        self.assertEqual(self.rec.volumes[-1], (33, False))
+        # a failed wpctl arms nothing
+        orig = rm._wpctl
+        setattr(rm, "_wpctl", lambda *a, **k: False)
+        self.addCleanup(setattr, rm, "_wpctl", orig)
+        self.assertFalse(self.w.set_pc(50, False))
+        self.w._events([("volume", 17, False)])
+        self.assertEqual(self.rec.volumes[-1], (17, False))
+
+    def test_default_rule_never_steals_a_headset(self):
+        self.feed(pw_graph_objs(default="bluez_output.headset"))
+        self.assertNotIn(("set-default", "85"), self.calls)
+        self.w.graph.default = ""          # no default at all -> take it
+        self.w._events([("default", "")])
+        self.assertIn(("set-default", "85"), self.calls)
+
+    def test_becoming_default_fixes_a_pre_attenuated_hdmi_sink(self):
+        objs = pw_graph_objs()  # default is the raw HDMI sink, at 40% muted
+        objs[0] = pw_node(80, HDMI, volumes=(0.064, 0.064), mute=True,
+                          **{"device.api": "alsa", "node.nick": "Roku TV"})
+        self.feed(objs)
+        self.assertIn(("set-default", "85"), self.calls)
+        self.assertNotIn(("set-volume", "80", "1.0"), self.calls)  # not ours yet
+        self.feed(objs, [pw_default(rm.PW_SINK)])  # WirePlumber confirms: now it is
+        self.assertEqual(self.calls[-2:], [("set-volume", "80", "1.0"), ("set-mute", "80", "0")])
+
+    def test_user_choice_of_raw_hdmi_is_respected_once_we_were_default(self):
+        self.feed(pw_graph_objs(default=rm.PW_SINK))
+        self.feed(pw_graph_objs(default=rm.PW_SINK), [pw_default(HDMI)])  # user picked raw HDMI
+        self.assertNotIn(("set-default", "85"), self.calls)
+
+    def test_removal_before_the_initial_dump_does_not_warn(self):
+        with self.assertNoLogs(rm.log, level="WARNING"):
+            self.feed([{"id": 7, "info": None}], pw_graph_objs())
+
+    def test_hdmi_unity_guard_only_when_we_are_default_and_once(self):
+        self.feed(pw_graph_objs(default=rm.PW_SINK))
+        self.w._events([("hdmi", 80, 40, True)])
+        self.assertEqual(self.calls[-2:], [("set-volume", "80", "1.0"), ("set-mute", "80", "0")])
+        self.w._events([("hdmi", 80, 40, False)])  # same node again: do not fight the user
+        self.assertEqual(len(self.calls), 2)
+        self.w._events([("hdmi", 88, 40, False)])  # the node came back (new id): fix again
+        self.assertEqual(len(self.calls), 4)
+        self.calls.clear()
+        self.w.graph.default = HDMI  # user picked the raw HDMI output on purpose
+        self.w._events([("hdmi", 90, 40, False)])
+        self.assertEqual(self.calls, [])
+
+    def test_missing_sink_warns_once_and_set_pc_fails_gracefully(self):
+        with self.assertLogs(rm.log, level="WARNING") as cm:
+            self.feed(pw_graph_objs(with_sink=False))
+        self.assertTrue(any("install.sh --volume" in m for m in cm.output))
+        self.assertEqual(self.rec.volumes, [])
+        self.assertFalse(self.w.set_pc(10, False))
+
+    def test_batches_survive_garbage_and_nested_brackets(self):
+        text = "[\n  {\"id\": 1, \"info\": null}\n]\nnot json\n]\n" + json.dumps(pw_graph_objs(), indent=2) + "\n"
+        self.w._follow(FakeProc(text))
+        self.assertIsNotNone(self.w.graph.sink)
+
+
+class ReconcilerVolumeTests(unittest.TestCase):
+    class FakeRoku:
+        """A TV: volume/mute state, keys act like a Roku TV, everything recorded."""
+
+        def __init__(self, vol=15, muted=False, app="tvinput.hdmi3", step=1, status=200):
+            self.vol, self.muted, self.app, self.step, self.status = vol, muted, app, step, status
+            self.keys = []
+            self.reads = 0
+            self.fail = None  # EcpError to raise from every call
+
+        def active_app(self, timeout=None):
+            if self.fail:
+                raise self.fail
+            return self.app, "Some App"
+
+        def audio_device(self, timeout=None):
+            if self.fail:
+                raise self.fail
+            self.reads += 1
+            return self.vol, self.muted
+
+        def keypress(self, key, timeout=None):
+            self.keys.append(key)
+            if self.status != 200:
+                return self.status
+            if key == "VolumeUp":
+                self.vol = min(100, self.vol + self.step)
+                self.muted = False
+            elif key == "VolumeDown":
+                self.vol = max(0, self.vol - self.step)
+            elif key == "VolumeMute":
+                self.muted = not self.muted
+            if self.vol == 0:
+                self.muted = True
+            return 200
+
+    def setUp(self):
+        orig = rm.VOLUME_SETTLE_S
+        setattr(rm, "VOLUME_SETTLE_S", 0.0)
+        self.addCleanup(setattr, rm, "VOLUME_SETTLE_S", orig)
+        self.cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_VOLUME": "true"})
+        self.pc = []
+
+    def make(self, roku, tv_on=True):
+        rec = rm.Reconciler(roku, self.cfg, pc_volume=lambda p, m: self.pc.append((p, m)) or True)
+        rec.tv_on = tv_on
+        return rec
+
+    def test_pc_to_tv_converges_in_one_round(self):
+        tv = self.FakeRoku(vol=15)
+        rec = self.make(tv)
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            rec._reconcile_volume((40, False), lambda: False)
+        self.assertEqual((tv.vol, tv.muted), (40, False))
+        self.assertEqual(tv.keys, ["VolumeUp"] * 25)
+        self.assertEqual(tv.reads, 2)
+        self.assertTrue(any("TV volume 15 -> 40" in m for m in cm.output))
+
+    def test_two_per_press_tv_settles_instead_of_oscillating(self):
+        tv = self.FakeRoku(vol=10, step=2)
+        rec = self.make(tv)
+        rec._reconcile_volume((16, False), lambda: False)
+        self.assertEqual(tv.vol, 16)  # 10 -> 22 (learn: 2 per key) -> 16
+        self.assertEqual(tv.keys, ["VolumeUp"] * 6 + ["VolumeDown"] * 3)
+        tv = self.FakeRoku(vol=10, step=2)
+        rec = self.make(tv)
+        with self.assertLogs(rm.log, level="WARNING") as cm:
+            rec._reconcile_volume((15, False), lambda: False)  # unreachable on such a TV
+        self.assertLessEqual(abs(tv.vol - 15), 1)
+        self.assertLessEqual(len(tv.keys), 8)
+        self.assertTrue(any("settled" in m for m in cm.output))
+
+    def test_dropped_keys_are_resent(self):
+        class Droppy(self.FakeRoku):
+            def keypress(self, key, timeout=None):
+                if len(self.keys) in (2, 5, 9):  # a few keys lost on the wire
+                    self.keys.append(key)
+                    return 200
+                return super().keypress(key, timeout)
+
+        tv = Droppy(vol=0)
+        rec = self.make(tv)
+        rec._reconcile_volume((30, False), lambda: False)
+        self.assertEqual(tv.vol, 30)
+
+    def test_stuck_tv_gives_up_with_one_warning(self):
+        tv = self.FakeRoku(vol=10, step=0)
+        rec = self.make(tv)
+        with self.assertLogs(rm.log, level="WARNING") as cm:
+            rec._reconcile_volume((20, False), lambda: False)
+        self.assertEqual(len(tv.keys), 10 * rm.VOLUME_ROUNDS)
+        self.assertTrue(any("settled" in m for m in cm.output))
+
+    def test_mute_then_unmute_keeps_the_slider_value(self):
+        tv = self.FakeRoku(vol=15)
+        rec = self.make(tv)
+        rec._reconcile_volume((15, True), lambda: False)
+        self.assertEqual((tv.vol, tv.muted), (15, True))
+        rec._reconcile_volume((10, True), lambda: False)   # PC went down while muted: mute only
+        self.assertEqual((tv.vol, tv.muted), (15, True))
+        rec._reconcile_volume((10, False), lambda: False)  # unmute applies the pending value
+        self.assertEqual((tv.vol, tv.muted), (10, False))
+        self.assertEqual(tv.keys, ["VolumeMute"] + ["VolumeDown"] * 5 + ["VolumeMute"])
+
+    def test_sync_sets_the_pc_and_never_presses_keys(self):
+        tv = self.FakeRoku(vol=33, muted=True)
+        rec = self.make(tv, tv_on=False)  # even while the TV is (believed) off: reading is harmless
+        rec._reconcile_volume(rm.SYNC, lambda: False)
+        self.assertEqual(self.pc, [(33, True)])
+        self.assertEqual(tv.keys, [])
+
+    def test_gates(self):
+        tv = self.FakeRoku(vol=15)
+        rec = self.make(tv, tv_on=False)
+        rec._reconcile_volume((40, False), lambda: False)
+        self.assertEqual(tv.keys, [])                   # TV believed off
+        rec.tv_on = True
+        tv.app = "tvinput.dtv"
+        rec._reconcile_volume((40, False), lambda: False)
+        self.assertEqual(tv.keys, [])                   # shared TV on another input
+        tv.app = "tvinput.hdmi3"
+        tv.status = 202
+        rec._reconcile_volume((40, False), lambda: False)
+        self.assertEqual(tv.keys, ["VolumeUp"])         # standby: first key is ignored, stop there
+        tv.status = 200
+        tv.fail = rm.EcpUnreachable("timed out")
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            rec._reconcile_volume((40, False), lambda: False)
+            rec._reconcile_volume((41, False), lambda: False)
+        self.assertEqual(len([m for m in cm.output if "not delivered" in m]), 1)  # once per streak
+
+    def test_stale_aborts_between_keys(self):
+        tv = self.FakeRoku(vol=0)
+        rec = self.make(tv)
+        rec._reconcile_volume((50, False), lambda: len(tv.keys) >= 5)
+        self.assertEqual(len(tv.keys), 5)
+
+    def test_request_volume_leaves_the_power_path_alone(self):
+        rec = self.make(self.FakeRoku())
+        gen, done = rec.gen, rec.done.is_set()
+        rec.request_volume((10, False))
+        self.assertEqual(rec.gen, gen)
+        self.assertEqual(rec.done.is_set(), done)
+        self.assertEqual(rec.volume, (10, False))
+
+    def test_volume_job_runs_on_the_thread(self):
+        tv = self.FakeRoku(vol=15)
+        rec = self.make(tv)
+        rec.start()
+        rec.request_volume((20, False))
+        for _ in range(100):
+            if tv.vol == 20:
+                break
+            rm.time.sleep(0.01)
+        self.assertEqual(tv.vol, 20)
+
+    def test_power_goes_first_and_its_sync_supersedes_a_stale_slider_value(self):
+        order = []
+        tv = self.FakeRoku(vol=15)
+        rec = rm.Reconciler(tv, self.cfg, pc_volume=lambda p, m: order.append(("sync", p, m)) or True)
+        orig_on = rm.ensure_on
+        setattr(rm, "ensure_on", lambda roku, cfg, stale=None: order.append("power") or True)
+        self.addCleanup(setattr, rm, "ensure_on", orig_on)
+        with rec.cv:  # queue both before the thread can pick either
+            rec.request_volume((20, False))  # moved while the TV was still coming on
+            rec.request(rm.ON)
+        rec.start()
+        for _ in range(200):
+            if len(order) >= 2:
+                break
+            rm.time.sleep(0.01)
+        # power first; then the TV wins at power-on (the stale 20% is not sent)
+        self.assertEqual(order, ["power", ("sync", 15, False)])
+        self.assertEqual(tv.keys, [])
+
+    def test_off_clears_tv_on_and_on_requests_sync(self):
+        class Quiet(self.FakeRoku):
+            def power_mode(self, timeout=None):
+                return "Ready"
+
+        rec = self.make(Quiet())
+        rec._reconcile(rm.OFF, urgent=True, stale=lambda: False)
+        self.assertFalse(rec.tv_on)
+        orig_on = rm.ensure_on
+        setattr(rm, "ensure_on", lambda roku, cfg, stale=None: True)
+        self.addCleanup(setattr, rm, "ensure_on", orig_on)
+        rec._reconcile(rm.ON, urgent=False, stale=lambda: False)
+        self.assertTrue(rec.tv_on)
+        self.assertEqual(rec.volume, rm.SYNC)
+
+
+class VolumeConfigTests(unittest.TestCase):
+    def test_knob(self):
+        self.assertFalse(rm.Config({"ROKU_TV_IP": "192.0.2.40"}).volume)
+        self.assertTrue(rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_VOLUME": "yes"}).volume)
 
 
 if __name__ == "__main__":
