@@ -2,9 +2,9 @@
 
 A single-purpose daemon: make a Roku TV mirror what this PC's GPU is driving.
 One file, zero dependencies, one rule (displays on → TV on + input; displays
-off → TV off). Keep it that way. The one opt-in extension (Linux,
-`ROKU_VOLUME`) is the same idea for sound: the PC's volume control *is* the
-TV's volume — same reconciler thread, same bounded-retry rule, no second rule.
+off → TV off). Keep it that way. The one opt-in extension (`ROKU_VOLUME`) is
+the same idea for sound: the PC's volume control *is* the TV's volume — same
+reconciler thread, same bounded-retry rule, no second rule.
 
 ## Principles (inherited from the homecast projects)
 - **Simplicity & minimalism.** Prefer deleting to adding. A knob needs a
@@ -46,6 +46,12 @@ TV's volume — same reconciler thread, same bounded-retry rule, no second rule.
   points (start, TV on, output reappears) the TV wins; in between the PC does.
 - The "Roku TV" PipeWire output is session-owned (`roku-monitor.pipewire.conf`
   drop-in), never created by the daemon: sound must not depend on it running.
+- Windows volume mirror: the keyboard hook lives on its own thread and its proc
+  only enqueues (LowLevelHooksTimeout removes slow hooks silently); it inspects
+  the three volume vkCodes and nothing else; keys are forwarded 1:1 with the
+  remote's semantics (no correction rounds); Core Audio (ctypes COM) is touched
+  only from the pump thread's poll and from `status`; act only while the Roku
+  endpoint is the default output — other outputs keep their keys.
 - This project is standalone: it does not import from or call the homecast
   stack at runtime.
 - Tests: `python3 -m unittest discover -s tests -v`. Shell: shellcheck-clean,

@@ -13,9 +13,10 @@ kernel's DRM state on Linux, the console display state on Windows — rather tha
 trusting a desktop environment's idea of "idle". So it works under GNOME, KDE,
 Sway and X11, and on Windows 10/11.
 
-Optional, on Linux: **the PC's volume keys and slider drive the TV's own
-volume** (`./install.sh --volume`) — full range, no remote on the desk, nothing
-attenuated twice. See *Linux: the volume* below.
+Optional, on both platforms: **the PC's volume control drives the TV's own
+volume** — full range, no remote on the desk, nothing attenuated twice. On
+Linux the keys *and* the slider (`./install.sh --volume`); on Windows the
+volume keys (`.\install.ps1 -Volume`). See *the volume* sections below.
 
 ## Requirements
 
@@ -95,7 +96,10 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 Same flow: it finds a real Python, creates `%APPDATA%\roku-monitor\env`, lets
 you pick the TV and input, then registers a **Scheduled Task** that starts the
 daemon with `pythonw.exe` (no console window) at every logon and restarts it if
-it ever dies. Logs go to `%LOCALAPPDATA%\roku-monitor\roku-monitor.log` —
+it ever dies. Add `-Volume` (now or later, same command) to make the volume
+keys drive the TV's own volume while the Roku TV is the default output — no
+files are added; it sets `ROKU_VOLUME=true` and restarts the daemon (brief TV
+off/on blink). Logs go to `%LOCALAPPDATA%\roku-monitor\roku-monitor.log` —
 there is no journal to write to.
 
 The task must run in your interactive session: the daemon listens for
@@ -142,7 +146,7 @@ ones that matter:
 | `ROKU_OFF_ON_SLEEP` / `ROKU_OFF_ON_STOP` | `true` | Turn the TV off before suspend / when the service stops (logout, `systemctl --user stop`). A `restart` is a stop+start, so expect a brief TV off/on blink; set `ROKU_OFF_ON_STOP=false` if that bothers you. |
 | `ROKU_OFF_DELAY_S` | `10` | Grace after the displays go dark; cancelled if they light up again. Absorbs "blank, then you touch the mouse". |
 | `ROKU_POWERON_TIMEOUT_S` | `45` | How long to wait for the TV to report it is on (a cold boot is ~30 s). |
-| `ROKU_VOLUME` | `false` | *Linux only.* Mirror the "Roku TV" output's volume/mute to the TV, and the TV's back into the slider at power-on. `install.sh --volume` sets it; it is a switch because it changes the audio graph. |
+| `ROKU_VOLUME` | `false` | The PC's volume control drives the TV's own volume. Linux: the "Roku TV" output's slider/mute mirror to the TV and back (`install.sh --volume` sets it; it changes the audio graph). Windows: the volume keys go to the TV while the Roku TV is the default output (`install.ps1 -Volume`; it installs a keyboard hook). |
 
 ## Commands
 
@@ -151,7 +155,7 @@ ones that matter:
 | `roku-monitor run` | The daemon (what the service runs). |
 | `roku-monitor discover` | SSDP scan; lists Rokus with name, kind, serial, MAC, power state. |
 | `roku-monitor discover --ip <tv-ip>` | Read one TV directly, for networks that block multicast. |
-| `roku-monitor status` | What the daemon sees: the display state, which monitor is the Roku, the TV's power mode + active input, and (Linux) the audio side: which sink feeds the TV, whether the "Roku TV" output exists and is the default, the TV's volume. |
+| `roku-monitor status` | What the daemon sees: the display state, which monitor is the Roku, the TV's power mode + active input, the TV's volume, and the audio side (Linux: which sink feeds the TV and whether the "Roku TV" output is the default; Windows: which output the volume keys currently belong to). |
 | `roku-monitor on` | One-shot "TV on + input" (exit 1 if it could not). |
 | `roku-monitor off [--force]` | One-shot TV off (`--force` ignores the shared-TV guard). |
 
@@ -280,6 +284,44 @@ volume piece: remove `~/.config/pipewire/pipewire.conf.d/90-roku-monitor.conf`,
 `systemctl --user restart pipewire`, and set `ROKU_VOLUME=false`;
 `./uninstall.sh` does the same as part of removing everything.
 
+### Windows: the volume (optional)
+
+Windows has the same underlying problem as Linux — the Roku's HDMI endpoint
+reports no hardware volume (`IAudioEndpointVolume::QueryHardwareSupport` says
+mute only), so the slider and keys just scale samples while the TV keeps its
+own level — but none of the Linux machinery: there is no in-box virtual output
+or pre-volume loopback to build a "Roku TV" device from, and third-party
+virtual cables are kernel drivers, which this project will not depend on. So
+Windows gets the other honest mechanism: **take the volume keys themselves.**
+
+With `ROKU_VOLUME=true` the daemon installs a low-level keyboard hook (on its
+own thread, so nothing the daemon does can stall it into Windows' silent-removal
+timeout). The hook looks at exactly three keys — `VolumeUp`, `VolumeDown`,
+`VolumeMute` — and nothing else, records nothing, and acts only **while the
+Roku TV is Windows' default output** (checked at the daemon's poll interval,
+1 s by default): each press is swallowed, so Windows neither changes its own volume nor
+shows its flyout, and is forwarded to the TV in order over the same closed-loop
+ECP path as Linux. The TV's own volume bar is the feedback; holding the key
+ramps at the TV's own rate (~25 steps/s, a small queue bounds the lag). The
+keys keep their remote semantics: Up unmutes, Down keeps a muted TV muted,
+Mute toggles. Pick your headphones as the output and the keys are Windows'
+again within a poll tick.
+
+While the TV endpoint is the default, its Windows volume belongs to the
+daemon: it is set to 100 % and unmuted when it becomes the default, and any
+Windows-side change that leaks in afterwards — a mute or a lowered slider from
+the lock screen, an elevated window, or the tray — springs back within a poll
+tick, with one log line saying so. (The tray slider is therefore not a control
+here; mirroring it *to the TV* instead is a possible follow-up.) Keys pressed
+while an **elevated** window is focused or on the **lock screen** bypass the
+hook by Windows security design and briefly behave like plain Windows volume
+keys; volume presses while the TV is off or showing another input are dropped
+with one log line, same as Linux. Volume traffic uses 1 s timeouts and yields
+to power work at every step, so at worst one in-flight request (~1 s) sits in
+front of the ~2 s pre-suspend "TV off" budget. To turn the mirror off:
+`.\install.ps1 -Volume:$false` (or set `ROKU_VOLUME=false` in
+`%APPDATA%\roku-monitor\env` and restart the task).
+
 ### Windows: the console display state
 
 Windows has no per-monitor power state — the console blanks as a whole — and no
@@ -378,6 +420,12 @@ corrected the next time the displays come back.
 - **TV volume overshoots or oscillates** → your model steps more than one per
   key; the log says `TV volume settled at N, wanted M`. The loop corrects
   itself within a step; please report the model.
+- **Volume keys do nothing to the TV** (Windows) → `python roku_monitor.py
+  status`: is the *default output* the Roku TV (that is the gate), is
+  `ROKU_VOLUME=true`, is the task running? The log shows `volume keys drive
+  the TV ...` at start and `TV volume 15 -> 21 (6 keys)` per burst. An
+  elevated window in focus or the lock screen bypasses the hook (Windows
+  security design) — the flyout appearing again is the tell.
 - **Nothing happens on Windows** → check the log first
   (`%LOCALAPPDATA%\roku-monitor\roku-monitor.log`) and
   `Get-ScheduledTaskInfo -TaskName roku-monitor`. The daemon only sees display
@@ -419,6 +467,8 @@ Get-ScheduledTaskInfo -TaskName roku-monitor
 python roku_monitor.py status
 Invoke-WebRequest "http://<tv-ip>:8060/query/active-app" -UseBasicParsing | Select-Object -Expand Content
 powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOCONLOCK   # lock-to-blank delay
+(Invoke-RestMethod "http://<tv-ip>:8060/query/audio-device").'audio-device'.global   # the TV's volume
+Select-String 'TV volume|default output|keyboard hook' "$env:LOCALAPPDATA\roku-monitor\roku-monitor.log" | Select-Object -Last 10
 ```
 
 ## Development

@@ -960,5 +960,263 @@ class VolumeConfigTests(unittest.TestCase):
         self.assertTrue(rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_VOLUME": "yes"}).volume)
 
 
+# ---------------------------------------------------------------------------
+# Windows volume mirror: the pure halves (hook decision, default-output watch,
+# key queue, key forwarding). No ctypes, no COM - runs on both CI runners.
+# ---------------------------------------------------------------------------
+
+class FakeAudio:
+    """The core_audio() seam: one Roku endpoint plus whatever the test sets."""
+
+    def __init__(self, default=("id-tv", "1 - Roku TV (AMD High Definition Audio Device)")):
+        self.default = default
+        self.levels = {"id-tv": (1.0, False)}
+        self.unity = []
+        self.broken = False
+
+    def default_render(self):
+        if self.broken:
+            raise OSError("com down")
+        return self.default
+
+    def level(self, dev_id):
+        return self.levels.get(dev_id)
+
+    def set_unity(self, dev_id):
+        self.unity.append(dev_id)
+        self.levels[dev_id] = (1.0, False)
+        return True
+
+
+class WinVolumeTests(unittest.TestCase):
+    class FakeReconciler:
+        def __init__(self):
+            self.keys = []
+
+        def request_key(self, key):
+            self.keys.append(key)
+
+    def make(self, audio=None):
+        sampler = rm.WindowsDisplaySampler()
+        sampler.roku_name = "Roku TV"
+        return rm.WinVolume(self.FakeReconciler(), sampler, audio if audio is not None else FakeAudio())
+
+    def test_is_roku_endpoint(self):
+        self.assertTrue(rm.is_roku_endpoint("1 - Roku TV (AMD High Definition Audio Device)"))
+        self.assertTrue(rm.is_roku_endpoint("Living room (NVIDIA)", "Living room"))
+        self.assertFalse(rm.is_roku_endpoint("Speakers (High Definition Audio Device)", "Roku TV") or
+                         rm.is_roku_endpoint("", None) or rm.is_roku_endpoint("anything", "TV"))
+
+    def test_keys_follow_the_default_output(self):
+        v = self.make()
+        d = rm.Daemon(rm.Config({"ROKU_TV_IP": "192.0.2.40"}), rm.WindowsDisplaySampler(),
+                      DaemonDebounceTests.FakeReconciler(), volume=v)
+        self.assertFalse(rm.handle_win_event(d, rm.EV_KEY, (0xAF, True)))  # not polled yet: inactive
+        v.poll()
+        self.assertTrue(v.active)
+        self.assertTrue(rm.handle_win_event(d, rm.EV_KEY, (0xAF, True)))
+        self.assertTrue(rm.handle_win_event(d, rm.EV_KEY, (0xAF, False)))  # the paired up
+        self.assertEqual(v.reconciler.keys, ["VolumeUp"])
+        d.volume = None
+        self.assertFalse(rm.handle_win_event(d, rm.EV_KEY, (0xAE, True)))  # mirror off: Windows' key
+
+    def test_key_up_follows_its_downs_decision(self):
+        v = self.make()
+        v.poll()
+        self.assertTrue(v.on_key(0xAE, True))
+        v.active = False                      # the default output changed mid-hold
+        self.assertTrue(v.on_key(0xAE, False))   # its up is still ours
+        self.assertFalse(v.on_key(0xAE, True))   # the next press is Windows'
+        self.assertFalse(v.on_key(0xAE, False))
+
+    def test_stop_is_sticky(self):
+        v = self.make()
+        v.poll()
+        v.stop()
+        self.assertFalse(v.on_key(0xAF, True))
+        v.poll()                               # a later tick must not resurrect it
+        self.assertFalse(v.on_key(0xAF, True))
+        self.assertEqual(v.reconciler.keys, [])
+
+    def test_poll_pins_once_when_becoming_default(self):
+        audio = FakeAudio()
+        audio.levels["id-tv"] = (0.4, True)
+        v = self.make(audio)
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            v.poll()
+        self.assertEqual(audio.unity, ["id-tv"])
+        self.assertTrue(any("set to 100%" in m for m in cm.output))
+        v.poll()
+        self.assertEqual(audio.unity, ["id-tv"])  # already ours and healthy: no more calls
+
+    def test_poll_undoes_leaked_windows_side_changes(self):
+        audio = FakeAudio()
+        v = self.make(audio)
+        v.poll()
+        self.assertEqual(audio.unity, [])          # was already 100%: no pin call
+        audio.levels["id-tv"] = (1.0, True)        # a leaked mute (lock screen)
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            v.poll()
+        self.assertEqual(audio.unity, ["id-tv"])   # put back (set_unity also unmutes)
+        self.assertTrue(any("set back to 100%" in m for m in cm.output))
+        audio.levels["id-tv"] = (0.7, False)       # slider moved (lock screen or tray)
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            v.poll()
+        self.assertEqual(audio.unity, ["id-tv", "id-tv"])
+        self.assertEqual(audio.levels["id-tv"], (1.0, False))
+        v.poll()                                   # healthy again: no more calls, no spam
+        self.assertEqual(len(audio.unity), 2)
+
+    def test_pin_retries_until_the_endpoint_answers(self):
+        audio = FakeAudio()
+        audio.levels.clear()                       # endpoint churn: level unknown on the became-tick
+        v = self.make(audio)
+        v.poll()
+        self.assertTrue(v.active)
+        self.assertEqual(audio.unity, [])
+        self.assertIsNone(v.endpoint_id)           # not recorded: the pin is still owed
+        audio.levels["id-tv"] = (0.4, False)
+        v.poll()
+        self.assertEqual(audio.unity, ["id-tv"])   # pinned on the tick the endpoint answered
+        self.assertEqual(v.endpoint_id, "id-tv")
+
+    def test_poll_keeps_state_on_com_errors_and_deactivates_on_other_outputs(self):
+        audio = FakeAudio()
+        v = self.make(audio)
+        v.poll()
+        audio.broken = True
+        v.poll()
+        self.assertTrue(v.active)                  # unknown != gone
+        audio.broken = False
+        audio.default = ("id-spk", "Speakers (High Definition Audio Device)")
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            v.poll()
+        self.assertFalse(v.active)
+        self.assertTrue(any("Windows' again" in m for m in cm.output))
+        audio.default = None
+        v.poll()                                   # no default at all: stays inactive, no log spam
+        self.assertFalse(v.active)
+
+
+class ReconcilerKeyTests(unittest.TestCase):
+    def setUp(self):
+        orig = rm.VOLUME_SETTLE_S
+        setattr(rm, "VOLUME_SETTLE_S", 0.0)
+        self.addCleanup(setattr, rm, "VOLUME_SETTLE_S", orig)
+        self.cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_VOLUME": "true"})
+
+    def make(self, roku, tv_on=True):
+        rec = rm.Reconciler(roku, self.cfg)
+        rec.tv_on = tv_on
+        return rec
+
+    def test_queue_is_capped_and_ordered_and_leaves_the_other_slots_alone(self):
+        rec = self.make(ReconcilerVolumeTests.FakeRoku())
+        gen, vgen, done = rec.gen, rec.vgen, rec.done.is_set()
+        for _ in range(rm.KEY_QUEUE_MAX + 4):
+            rec.request_key("VolumeUp")
+        self.assertEqual(len(rec.keys), rm.KEY_QUEUE_MAX)
+        self.assertEqual((rec.gen, rec.vgen, rec.done.is_set()), (gen, vgen, done))
+        rec.request_key("VolumeMute")          # a full queue sheds a repeat, never a Mute
+        self.assertEqual(len(rec.keys), rm.KEY_QUEUE_MAX)
+        self.assertEqual(rec.keys[-1], "VolumeMute")
+
+    def test_keys_are_forwarded_in_order_with_remote_semantics(self):
+        tv = ReconcilerVolumeTests.FakeRoku(vol=15)
+        rec = self.make(tv)
+        for key in ("VolumeUp", "VolumeUp", "VolumeMute", "VolumeDown", "VolumeMute"):
+            rec.request_key(key)
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            rec._reconcile_keys(lambda: False)
+        self.assertEqual(tv.keys, ["VolumeUp", "VolumeUp", "VolumeMute", "VolumeDown", "VolumeMute"])
+        self.assertEqual((tv.vol, tv.muted), (16, False))  # 15+2, mute on, down (still muted), mute off
+        self.assertTrue(any("(5 keys)" in m for m in cm.output))
+        self.assertEqual(len(rec.keys), 0)
+
+    def test_gates_clear_the_queue(self):
+        tv = ReconcilerVolumeTests.FakeRoku(vol=15)
+        rec = self.make(tv, tv_on=False)
+        rec.request_key("VolumeUp")
+        rec._reconcile_keys(lambda: False)
+        self.assertEqual((len(rec.keys), tv.keys), (0, []))          # TV believed off
+        rec.tv_on = True
+        tv.app = "tvinput.dtv"
+        rec.request_key("VolumeUp")
+        rec._reconcile_keys(lambda: False)
+        self.assertEqual((len(rec.keys), tv.keys), (0, []))          # shared TV, other input
+        tv.app = "tvinput.hdmi3"
+        tv.status = 202
+        rec.request_key("VolumeUp")
+        rec.request_key("VolumeUp")
+        rec._reconcile_keys(lambda: False)
+        self.assertEqual((len(rec.keys), len(tv.keys)), (0, 1))      # standby: stop after the first 202
+        tv.status = 200
+        tv.fail = rm.EcpUnreachable("timed out")
+        rec.request_key("VolumeUp")
+        rec._reconcile_keys(lambda: False)
+        self.assertEqual(len(rec.keys), 0)                           # unreachable: dropped, one skip line
+
+    def test_power_edge_aborts_but_keeps_the_rest_of_the_burst(self):
+        tv = ReconcilerVolumeTests.FakeRoku(vol=15)
+        rec = self.make(tv)
+        for _ in range(5):
+            rec.request_key("VolumeDown")
+        rec._reconcile_keys(lambda: len(tv.keys) >= 2)
+        self.assertEqual(len(tv.keys), 2)
+        self.assertEqual(len(rec.keys), 3)  # the power job runs, then these follow
+
+    def test_keys_job_runs_on_the_thread(self):
+        tv = ReconcilerVolumeTests.FakeRoku(vol=15)
+        rec = self.make(tv)
+        rec.start()
+        for _ in range(3):
+            rec.request_key("VolumeUp")
+        for _ in range(100):
+            if tv.vol == 18:
+                break
+            rm.time.sleep(0.01)
+        self.assertEqual(tv.vol, 18)
+
+
+class WindowsCtypesTests(unittest.TestCase):
+    """Real-Windows-only checks: the struct layouts core_audio() assumes, and
+    that the COM layer degrades instead of crashing on a desktop-less runner."""
+
+    @unittest.skipUnless(rm.IS_WIN, "layouts only matter where they are used")
+    def test_struct_sizes(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("d1", wintypes.DWORD), ("d2", wintypes.WORD), ("d3", wintypes.WORD),
+                        ("d4", ctypes.c_ubyte * 8)]
+
+        class PROPERTYKEY(ctypes.Structure):
+            _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+        class PROPVARIANT(ctypes.Structure):
+            _fields_ = [("vt", wintypes.WORD), ("r1", wintypes.WORD), ("r2", wintypes.WORD),
+                        ("r3", wintypes.WORD), ("pwszVal", ctypes.c_wchar_p), ("pad", ctypes.c_void_p)]
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                        ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        ptr = ctypes.sizeof(ctypes.c_void_p)   # the layouts scale with pointer width
+        self.assertEqual(ctypes.sizeof(GUID), 16)
+        self.assertEqual(ctypes.sizeof(PROPERTYKEY), 20)
+        self.assertEqual(ctypes.sizeof(PROPVARIANT), 8 + 2 * ptr)
+        self.assertEqual(ctypes.sizeof(KBDLLHOOKSTRUCT), 16 + ptr)
+
+    @unittest.skipUnless(rm.IS_WIN, "COM only exists on Windows")
+    def test_core_audio_degrades_without_a_desktop(self):
+        try:
+            audio = rm.core_audio()
+            audio.default_render()  # None or a tuple; either is fine, no exception type but OSError
+        except OSError:
+            pass                    # CI runners have no audio service
+
+
 if __name__ == "__main__":
     unittest.main()

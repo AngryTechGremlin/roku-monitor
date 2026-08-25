@@ -10,9 +10,13 @@
   Skip the interactive "which TV?" step.
 .PARAMETER NoStart
   Register the task but do not start the daemon now.
+.PARAMETER Volume
+  Volume keys drive the TV's own volume while the Roku TV is the default
+  output (sets ROKU_VOLUME=true and restarts the daemon). See the README.
+  -Volume:$false turns it back off the same way.
 #>
 [CmdletBinding()]
-param([switch]$NoDiscover, [switch]$NoStart)
+param([switch]$NoDiscover, [switch]$NoStart, [switch]$Volume)
 
 $ErrorActionPreference = 'Stop'
 $App     = 'roku-monitor'
@@ -132,6 +136,13 @@ if (-not $NoDiscover) {
     }
 }
 
+# --- volume mirror (optional) -------------------------------------------------
+if ($PSBoundParameters.ContainsKey('Volume')) {
+    Set-Conf 'ROKU_VOLUME' $(if ($Volume) { 'true' } else { 'false' })
+    if ($Volume) { Say 'ROKU_VOLUME=true: the volume keys drive the TV while the Roku TV is the default output' }
+    else { Say 'ROKU_VOLUME=false: the volume keys are Windows'' again' }
+}
+
 # --- logon task --------------------------------------------------------------
 # Must run in the interactive session: the daemon listens for display-power
 # messages on a hidden window, which only exists in a real user session.
@@ -163,8 +174,40 @@ try {
 
 if (-not $NoStart) {
     if ($haveTask) {
-        try { Start-ScheduledTask -TaskName $App; Start-Sleep -Seconds 3; Say 'started' }
+        # A daemon that is already running survives Register -Force, and
+        # Start-ScheduledTask is ignored while it runs (MultipleInstances
+        # IgnoreNew) - and a fresh start would exit on the single-instance
+        # mutex anyway. So stop the old one first: politely (WM_CLOSE, which
+        # runs its normal "TV off" stop path - expect a brief TV blink), and
+        # by the task if the polite way cannot reach its window (e.g. SSH).
+        # Match the daemon only (the `run` subcommand), not a CLI 'status' someone left open.
+        $old = @(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'roku_monitor\.py"?\s+run(\s|$)' })
+        if ($old) {
+            # cmd /c keeps taskkill's stderr away from PowerShell 5.1, where a
+            # redirected native stderr under $ErrorActionPreference=Stop is fatal.
+            foreach ($p in $old) { cmd /c "taskkill /PID $($p.ProcessId) >nul 2>&1" }
+            $deadline = (Get-Date).AddSeconds(10)
+            while ((Get-Date) -lt $deadline -and
+                   @($old | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }).Count) {
+                Start-Sleep -Milliseconds 500
+            }
+            if (@($old | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }).Count) {
+                try { Stop-ScheduledTask -TaskName $App -ErrorAction SilentlyContinue } catch { }
+                Start-Sleep -Seconds 2
+            }
+            # The polite path cannot cross sessions (SSH) and Stop-ScheduledTask only
+            # stops task-owned instances: anything still alive holds the old config
+            # (and the single-instance mutex), so a new start would be a silent no-op.
+            $left = @($old | Where-Object { Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue })
+            foreach ($p in $left) { cmd /c "taskkill /F /PID $($p.ProcessId) >nul 2>&1" }
+            if ($left) { Start-Sleep -Seconds 1 }
+        }
+        try { Start-ScheduledTask -TaskName $App; Start-Sleep -Seconds 3 }
         catch { Warn "could not start: $($_.Exception.Message)" }
+        if (@(Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -match 'roku_monitor\.py"?\s+run(\s|$)' }).Count) { Say 'started' }
+        else { Warn 'the daemon is not running; check the log' }
     } else {
         Say 'sign out and back in to start it (or run it once by hand)'
     }
@@ -172,6 +215,7 @@ if (-not $NoStart) {
 
 Say 'done.'
 Write-Host "  config: $Conf"
+if ($Volume) { Write-Host "  volume: keys drive the TV while the Roku TV is the default output" }
 Write-Host "  log:    $(Join-Path $LogDir "$App.log")"
 Write-Host "  status: & '$python' '$Script' status"
 Write-Host "  task:   Get-ScheduledTaskInfo -TaskName $App"

@@ -18,11 +18,15 @@ never a desktop environment's intent:
           console (physical) display state, delivered to a hidden window,
           plus the suspend/session-end messages. ctypes only, no pip deps.
 
-Optional, Linux only (ROKU_VOLUME=true): the PC's volume control is the TV's
-volume. A "Roku TV" PipeWire output (roku-monitor.pipewire.conf) carries the
-sound to the HDMI sink unattenuated; the daemon mirrors its slider to the TV
-with VolumeUp/VolumeDown/VolumeMute, verified against the TV's own reading
-(/query/audio-device). Only `pw-dump` and `wpctl` are used (subprocesses).
+Optional (ROKU_VOLUME=true): the PC's volume control is the TV's volume.
+  Linux   a "Roku TV" PipeWire output (roku-monitor.pipewire.conf) carries the
+          sound to the HDMI sink unattenuated; the daemon mirrors its slider to
+          the TV with VolumeUp/VolumeDown/VolumeMute, verified against the TV's
+          own reading (/query/audio-device). Uses `pw-dump` and `wpctl` only.
+  Windows there is no virtual output to make, so the volume keys themselves are
+          taken over: while the Roku TV is the default output a keyboard hook
+          forwards VolumeUp/VolumeDown/VolumeMute presses to the TV (its own
+          bar is the display) and the TV's Windows endpoint is pinned at 100%.
 
 See README.md for the why behind each choice.
 
@@ -30,6 +34,7 @@ Subcommands: run | discover | status | on | off
 """
 
 import argparse
+import collections
 import glob
 import http.client
 import ipaddress
@@ -65,10 +70,12 @@ PW_SINK = "roku-tv"                         # the virtual "Roku TV" output GNOME
 PW_RELAY_CAPTURE = "roku-tv-relay.capture"  # loopback: PW_SINK monitor -> ...
 PW_RELAY_PLAYBACK = "roku-tv-relay.playback"  # ... -> the real HDMI sink (target.object)
 SYNC = "SYNC"              # reconciler job: PC slider := TV volume ("TV wins")
+KEYS = "KEYS"              # reconciler job: drain the Windows key queue to the TV
 VOLUME_ROUNDS = 3          # per job: send keys, re-read the TV, correct; then give up
 VOLUME_KEY_GAP_S = 0.0     # measured: 20 keypresses back to back, none dropped (~40 ms each)
 VOLUME_SETTLE_S = 0.1      # the TV reports the new value at once; a small margin anyway
 VOLUME_TIMEOUT_S = 1.0     # per request, so a volume job never eats the urgent-off budget
+KEY_QUEUE_MAX = 6          # Windows: typematic ~30/s vs the TV ~25/s; bounds hold lag to ~0.25s
 PW_DUMP_LADDER = (0, 3, 8, 15, 30, 60)  # seconds between pw-dump respawns (PipeWire restart)
 
 log = logging.getLogger(APP)
@@ -200,7 +207,7 @@ class Config:
             raise ConfigError(f"numeric setting is not a number: {e}")
         self.wol_broadcast = v["ROKU_WOL_BROADCAST"]
         self.log_level = v["ROKU_LOG_LEVEL"].upper()
-        self.volume = _as_bool(v["ROKU_VOLUME"])  # Linux only; needs install.sh --volume
+        self.volume = _as_bool(v["ROKU_VOLUME"])  # install.sh --volume / install.ps1 -Volume set it
 
     @classmethod
     def load(cls, explicit=None):
@@ -359,6 +366,10 @@ EV_SUSPEND = "suspend"
 EV_RESUME = "resume"
 EV_ENDSESSION = "endsession"  # value: True if logging off rather than shutting down
 EV_CLOSE = "close"
+EV_KEY = "key"              # value: (vkCode, is_down); return True = swallow the key
+
+# Volume keys the hook watches - the only keys it ever looks at.
+VK_VOLUME = {0xAF: "VolumeUp", 0xAE: "VolumeDown", 0xAD: "VolumeMute"}
 
 
 def pnp_vendor(code):
@@ -414,6 +425,9 @@ def handle_win_event(daemon, kind, value=None):
     if kind == EV_CLOSE:
         daemon.on_term()
         return True
+    if kind == EV_KEY:
+        vk, down = value
+        return daemon.volume is not None and daemon.volume.on_key(vk, down)
     return False
 
 
@@ -541,6 +555,352 @@ def list_windows_targets():
     raise OSError("QueryDisplayConfig kept resizing")
 
 
+def is_roku_endpoint(name, roku_name=None):
+    """Does this Windows audio endpoint belong to the Roku TV? Vendor display-audio
+    drivers name HDMI endpoints after the display's EDID name, so the endpoint
+    shows up as e.g. "1 - Roku TV (AMD High Definition Audio Device)"."""
+    hay = (name or "").lower()
+    if "roku" in hay:
+        return True
+    want = (roku_name or "").strip().lower()
+    return len(want) >= 3 and want in hay
+
+
+class WinVolume:
+    """Windows counterpart of VolumeWatcher: while the Roku TV endpoint is the
+    default output, the volume keys are the TV's (hook -> reconciler -> ECP) and
+    the endpoint itself is kept at 100% (the TV does the attenuating). Pure
+    bookkeeping except poll(), which talks Core Audio through the `audio` seam
+    (core_audio(); tests inject a fake, None keeps everything inert)."""
+
+    def __init__(self, reconciler, sampler, audio=None):
+        self.reconciler = reconciler
+        self.sampler = sampler
+        self.audio = audio
+        self.active = False      # the Roku endpoint is the default render device
+        self.endpoint_id = None  # its id while active (pin-once-per-appearance guard)
+        self._stopped = False    # sticky: after stop() the keys are Windows' again
+        self._held = set()       # vk codes whose key-down we swallowed
+        self._quiet = None       # the current nag, logged once per streak
+
+    def start(self):  # the hook itself is started by run_windows_loop
+        pass
+
+    def stop(self):
+        self._stopped = True
+
+    def on_key(self, vk, down):
+        """Hook side: True = swallow. Bookkeeping only - the hook must return
+        within LowLevelHooksTimeout, so no I/O, no COM, no logging in here.
+        A key-up always follows its key-down's decision, so Windows never sees
+        an unpaired press when the gate flips mid-hold."""
+        if down:
+            if self._stopped or not self.active:
+                self._held.discard(vk)
+                return False
+            self._held.add(vk)
+            self.reconciler.request_key(VK_VOLUME[vk])
+            return True
+        if vk in self._held:
+            self._held.discard(vk)
+            return True
+        return False
+
+    def poll(self):
+        """Pump-thread side, once per tick: is the Roku endpoint the default
+        output, and is it still at 100%/unmuted? A COM error keeps the last
+        known state (no transition, no noise)."""
+        if self.audio is None or self._stopped:
+            return
+        try:
+            default = self.audio.default_render()
+        except OSError as e:
+            log.debug("default output unknown (%s)", e)
+            return
+        if default is None:
+            self._set_active(False, None, "no output device")
+            return
+        dev_id, name = default
+        if not is_roku_endpoint(name, getattr(self.sampler, "roku_name", None)):
+            self._set_active(False, name, "another output is the default")
+            return
+        became = self._set_active(True, name, None) or self.endpoint_id != dev_id
+        level = self.audio.level(dev_id)
+        if level is None:
+            return  # endpoint churn mid-tick; endpoint_id stays as-is, so the pin retries
+        scalar, muted = level
+        if became:
+            # The endpoint just became ours: 100% and unmuted, so what the TV
+            # gets is full scale and only the TV's own volume applies.
+            if scalar < 0.995 or muted:
+                if not self.audio.set_unity(dev_id):
+                    return  # transient failure: not recorded, next tick retries the pin
+                log.info("Windows volume of the Roku TV output was %d%%%s - set to 100%% "
+                         "(the TV does the attenuating)", round(scalar * 100), " muted" if muted else "")
+            self.endpoint_id = dev_id
+            return
+        if muted or scalar < 0.995:
+            # A Windows-side change leaked in (lock screen, elevated window, the
+            # tray slider). The keys we swallow could never undo it, so put it
+            # back: this endpoint's level belongs to the daemon while it is the
+            # default - the TV does the attenuating.
+            if self.audio.set_unity(dev_id):
+                self._nag("the Roku TV output was changed in Windows (%d%%%s) - set back to 100%%; "
+                          "the volume keys change the TV instead" % (round(scalar * 100), " muted" if muted else ""))
+        else:
+            self._quiet = None
+
+    def _set_active(self, active, name, why):
+        """Returns True on the inactive -> active transition."""
+        if active and not self.active:
+            self.active = True
+            self._quiet = None
+            log.info("the Roku TV is the default output - the volume keys are the TV's")
+            log.debug("default output: %s", name)
+            return True
+        if not active and self.active:
+            self.active = False
+            self.endpoint_id = None
+            log.info("the volume keys are Windows' again (%s)", why)
+            log.debug("default output: %s", name or "-")
+        return False
+
+    def _nag(self, text):
+        if text != self._quiet:
+            log.info("%s", text)
+            self._quiet = text
+
+
+def core_audio():
+    """Windows Core Audio through ctypes COM - no dependencies, read/write of
+    endpoint volumes only. Create and use on one thread (it CoInitializes an
+    STA there). Raises OSError when COM itself is unavailable; the returned
+    object's methods return None for devices that are gone or inactive."""
+    import ctypes
+    from ctypes import wintypes
+
+    ole32 = ctypes.OleDLL("ole32")            # HRESULT-checked: failures raise OSError
+    ole32raw = ctypes.WinDLL("ole32")
+    ole32raw.CoTaskMemFree.restype = None
+    ole32raw.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("data1", wintypes.DWORD), ("data2", wintypes.WORD),
+                    ("data3", wintypes.WORD), ("data4", ctypes.c_ubyte * 8)]
+
+        def __init__(self, text=None):
+            super().__init__()
+            if text:
+                ole32.CLSIDFromString(text, ctypes.byref(self))
+
+    class PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+    class PROPVARIANT(ctypes.Structure):      # 24 bytes on x64: GetValue writes all of it
+        _fields_ = [("vt", wintypes.WORD), ("r1", wintypes.WORD), ("r2", wintypes.WORD),
+                    ("r3", wintypes.WORD), ("pwszVal", ctypes.c_wchar_p), ("pad", ctypes.c_void_p)]
+
+    def com(ptr, index, *argtypes):
+        """A bound COM method by vtable slot (IUnknown = 0..2)."""
+        vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+    def check(hr, what):
+        if hr < 0:
+            raise OSError(f"{what}: HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+
+    def release(ptr):
+        com(ptr, 2)(ptr)
+
+    try:
+        ole32.CoInitializeEx(None, 2)         # COINIT_APARTMENTTHREADED
+    except OSError:
+        pass                                  # RPC_E_CHANGED_MODE: already initialised differently
+    enumerator = ctypes.c_void_p()
+    check(ole32.CoCreateInstance(
+        ctypes.byref(GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")), None, 0x17,
+        ctypes.byref(GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")),
+        ctypes.byref(enumerator)), "MMDeviceEnumerator")
+    iid_volume = GUID("{5CDF2C82-841E-4546-9722-0CF74078229A}")
+    pkey_name = PROPERTYKEY(GUID("{A45C254E-DF1C-4EFD-8020-67D146A850E0}"), 14)
+
+    class _CoreAudio:
+        def _name(self, dev):
+            store = ctypes.c_void_p()
+            check(com(dev, 4, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p))(
+                dev, 0, ctypes.byref(store)), "OpenPropertyStore")
+            try:
+                pv = PROPVARIANT()
+                check(com(store, 5, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))(
+                    store, ctypes.byref(pkey_name), ctypes.byref(pv)), "GetValue")
+                try:
+                    return pv.pwszVal or "" if pv.vt == 31 else ""   # VT_LPWSTR
+                finally:
+                    ole32.PropVariantClear(ctypes.byref(pv))
+            finally:
+                release(store)
+
+        def _id(self, dev):
+            p = ctypes.c_wchar_p()
+            check(com(dev, 5, ctypes.POINTER(ctypes.c_wchar_p))(dev, ctypes.byref(p)), "GetId")
+            try:
+                return p.value or ""
+            finally:
+                ole32raw.CoTaskMemFree(p)
+
+        def _endpoint_volume(self, dev):
+            vol = ctypes.c_void_p()
+            hr = com(dev, 3, ctypes.POINTER(GUID), wintypes.DWORD, ctypes.c_void_p,
+                     ctypes.POINTER(ctypes.c_void_p))(
+                dev, ctypes.byref(iid_volume), 0x17, None, ctypes.byref(vol))
+            return vol if hr >= 0 else None   # gone/inactive endpoints refuse to activate
+
+        def default_render(self):
+            """(endpoint id, friendly name) of the default output; None when there
+            is none; OSError on a real failure (the caller keeps its state)."""
+            dev = ctypes.c_void_p()
+            hr = com(enumerator, 4, wintypes.DWORD, wintypes.DWORD,
+                     ctypes.POINTER(ctypes.c_void_p))(enumerator, 0, 0, ctypes.byref(dev))
+            if hr == -2147023728:             # E_NOTFOUND: no render device at all
+                return None
+            check(hr, "GetDefaultAudioEndpoint")
+            try:
+                return self._id(dev), self._name(dev)
+            finally:
+                release(dev)
+
+        def _by_id(self, dev_id):
+            dev = ctypes.c_void_p()
+            hr = com(enumerator, 5, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p))(
+                enumerator, dev_id, ctypes.byref(dev))
+            return dev if hr >= 0 else None
+
+        def level(self, dev_id):
+            """(scalar 0..1, muted) of an endpoint, or None when unavailable -
+            including an endpoint that invalidates mid-call (TV churn)."""
+            try:
+                return self._level(dev_id)
+            except OSError:
+                return None
+
+        def _level(self, dev_id):
+            dev = self._by_id(dev_id)
+            if dev is None:
+                return None
+            try:
+                vol = self._endpoint_volume(dev)
+                if vol is None:
+                    return None
+                try:
+                    f, mute = ctypes.c_float(), wintypes.BOOL()
+                    check(com(vol, 9, ctypes.POINTER(ctypes.c_float))(vol, ctypes.byref(f)),
+                          "GetMasterVolumeLevelScalar")
+                    check(com(vol, 15, ctypes.POINTER(wintypes.BOOL))(vol, ctypes.byref(mute)),
+                          "GetMute")
+                    return f.value, bool(mute.value)
+                finally:
+                    release(vol)
+            finally:
+                release(dev)
+
+        def set_unity(self, dev_id):
+            """The endpoint to 100% and unmuted. True when it worked; a failing
+            or vanishing endpoint is False, never an exception (retried next tick)."""
+            try:
+                return self._set_unity(dev_id)
+            except OSError:
+                return False
+
+        def _set_unity(self, dev_id):
+            dev = self._by_id(dev_id)
+            if dev is None:
+                return False
+            try:
+                vol = self._endpoint_volume(dev)
+                if vol is None:
+                    return False
+                try:
+                    check(com(vol, 7, ctypes.c_float, ctypes.c_void_p)(vol, 1.0, None),
+                          "SetMasterVolumeLevelScalar")
+                    check(com(vol, 14, wintypes.BOOL, ctypes.c_void_p)(vol, 0, None), "SetMute")
+                    return True
+                finally:
+                    release(vol)
+            finally:
+                release(dev)
+
+    return _CoreAudio()
+
+
+class KeyHookThread(threading.Thread):
+    """Hosts the WH_KEYBOARD_LL hook on its own message loop, so nothing the
+    daemon does elsewhere (a slow tick, the urgent TV-off) can stall the hook
+    past LowLevelHooksTimeout and get it silently removed by Windows. The proc
+    is a forwarder: it looks at the three volume vkCodes and nothing else."""
+
+    def __init__(self, win_daemon):
+        super().__init__(daemon=True, name="keys")
+        self.win_daemon = win_daemon
+        self.tid = None
+        self.ok = False
+        self.ready = threading.Event()
+
+    def run(self):
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
+        LRESULT = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        WPARAM, LPARAM = ctypes.c_size_t, ctypes.c_ssize_t
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                        ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, WPARAM, LPARAM)
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, WPARAM, LPARAM]
+        user32.CallNextHookEx.restype = LRESULT
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.GetMessageW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+        def on_key(ncode, wparam, lparam):
+            if ncode == 0:  # HC_ACTION
+                vk = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents.vkCode
+                if vk in VK_VOLUME:
+                    try:
+                        down = wparam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                        if handle_win_event(self.win_daemon, EV_KEY, (vk, down)):
+                            return 1  # swallowed: no Windows volume change, no flyout
+                    except Exception:
+                        _warn_once("hook", "keyboard hook handler failed - keys stay with Windows")
+            return user32.CallNextHookEx(None, ncode, wparam, lparam)
+
+        self._proc = HOOKPROC(on_key)  # must outlive the hook
+        self.tid = kernel32.GetCurrentThreadId()
+        hook = user32.SetWindowsHookExW(13, self._proc, kernel32.GetModuleHandleW(None), 0)  # WH_KEYBOARD_LL
+        self.ok = bool(hook)
+        self.ready.set()
+        if not hook:
+            return
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            pass  # only WM_QUIT ever arrives; the hook itself runs off this pump
+        user32.UnhookWindowsHookEx(hook)
+
+    def stop(self):
+        if self.tid is not None and self.ok:
+            import ctypes
+            ctypes.WinDLL("user32").PostThreadMessageW(self.tid, 0x0012, 0, 0)  # WM_QUIT
+
+
 def run_windows_loop(daemon):
     """Hidden-window message pump: display state, suspend/resume, session end.
 
@@ -616,6 +976,8 @@ def run_windows_loop(daemon):
 
     def on_message(hwnd, msg, wparam, lparam):
         if msg == WM_TIMER:
+            if daemon.volume is not None:
+                daemon.volume.poll()  # is the Roku TV still the default output?
             daemon.tick()
             return 0
         if msg == WM_POWERBROADCAST:
@@ -692,6 +1054,22 @@ def run_windows_loop(daemon):
     user32.SetTimer(hwnd, 1, int(daemon.cfg.poll_s * 1000), None)
     log.info("watching the console display state (hidden window)")
 
+    hook = None
+    if daemon.volume is not None:
+        try:
+            daemon.volume.audio = core_audio()
+        except OSError as e:
+            log.warning("Core Audio unavailable (%s) - ROKU_VOLUME does nothing", e)
+        if daemon.volume.audio is not None:
+            daemon.volume.poll()  # know the default output before the first key
+            hook = KeyHookThread(daemon)
+            hook.start()
+            hook.ready.wait(5.0)
+            if hook.ok:
+                log.info("volume keys drive the TV while the Roku TV is the default output")
+            else:
+                log.warning("could not install the keyboard hook - volume keys stay with Windows")
+
     def on_ctrl(_type):
         daemon.on_int()
         user32.PostMessageW(hwnd, WM_DESTROY, 0, 0)
@@ -707,6 +1085,8 @@ def run_windows_loop(daemon):
         user32.DispatchMessageW(ctypes.byref(msg))
         if daemon.stop_event.is_set():
             break
+    if hook is not None:
+        hook.stop()
     return daemon.exit_code
 
 
@@ -1506,6 +1886,7 @@ class Reconciler(threading.Thread):
         self.vgen = 0
         self.tv_on = False       # the last ensure_on() succeeded: on and on our input
         self.pc_volume = pc_volume  # callable(pct, muted) -> bool that sets the PC slider
+        self.keys = collections.deque()  # Windows: swallowed volume keys, forwarded in order
         self._vol_skip = None    # why the last PC -> TV job was dropped (logged once per streak)
 
     def request(self, target, urgent=False):
@@ -1523,21 +1904,43 @@ class Reconciler(threading.Thread):
             self.vgen += 1
             self.cv.notify()
 
+    def request_key(self, key):
+        """One remote key from the Windows hook. The queue is small on purpose:
+        the TV takes ~25 keys/s and typematic repeat makes ~30/s, so a cap keeps
+        a held key ramping at the TV's own rate with a bounded backlog; extra
+        repeats are ones the TV could not have taken anyway."""
+        with self.cv:
+            if len(self.keys) < KEY_QUEUE_MAX:
+                self.keys.append(key)
+            elif self.keys[-1] != key:
+                self.keys[-1] = key  # never lose a Mute behind held repeats
+            else:
+                return
+            self.cv.notify()
+
     def wait_done(self, timeout):
         return self.done.wait(timeout)
 
     def run(self):
         while True:
             with self.cv:
-                while self.target is None and self.volume is None:
+                while self.target is None and self.volume is None and not self.keys:
                     self.cv.wait()
-                if self.target is not None:
+                if self.target is not None:  # power first: it is what the rule is about
                     target, urgent, gen = self.target, self.urgent, self.gen
                     self.target = None
                     want = None
-                else:
+                elif self.volume is not None:
                     want, vgen, gen = self.volume, self.vgen, self.gen
                     self.volume = None
+                else:
+                    want, vgen, gen = KEYS, self.vgen, self.gen
+            if want is KEYS:
+                try:
+                    self._reconcile_keys(lambda: self.gen != gen)
+                except Exception:
+                    log.exception("volume keys failed")
+                continue
             if want is not None:
                 try:
                     self._reconcile_volume(want, lambda: self.gen != gen or self.vgen != vgen)
@@ -1609,7 +2012,7 @@ class Reconciler(threading.Thread):
             return
         pct, muted = want
         if not self.tv_on:
-            self._skip("TV is not on (as far as we know) - PC volume changes are not sent")
+            self._skip("TV is not on (as far as we know) - volume changes are not sent")
             return
         try:
             app_id, name = roku.active_app(timeout=t)
@@ -1627,7 +2030,7 @@ class Reconciler(threading.Thread):
                     if stale():
                         return  # a newer value or a power edge: that job takes over
                     if roku.keypress(key, timeout=t) == 202:
-                        self._skip("TV accepted but ignored a volume key (standby?) - PC volume changes are not sent")
+                        self._skip("TV accepted but ignored a volume key (standby?) - volume changes are not sent")
                         return
                     if VOLUME_KEY_GAP_S:
                         time.sleep(VOLUME_KEY_GAP_S)
@@ -1648,6 +2051,56 @@ class Reconciler(threading.Thread):
         elif (tv_vol, tv_muted) != start:
             log.info("TV volume %d%s -> %d%s", start[0], " muted" if start[1] else "",
                      tv_vol, " muted" if tv_muted else "")
+
+    def _clear_keys(self):
+        with self.cv:
+            self.keys.clear()
+
+    def _reconcile_keys(self, stale):
+        """Windows: forward swallowed volume keys to the TV in order - remote
+        semantics, no correction rounds (Up unmutes, Down keeps a muted TV
+        muted, Mute toggles; the TV's own bar is the feedback). One gate per
+        burst; bounded by the queue cap; `stale` is a power edge only."""
+        roku, t, cfg = self.roku, VOLUME_TIMEOUT_S, self.cfg
+        if stale() or not self.tv_on:
+            if not self.tv_on:
+                self._clear_keys()
+                self._skip("TV is not on (as far as we know) - volume changes are not sent")
+            return
+        try:
+            app_id, name = roku.active_app(timeout=t)
+            if app_id != cfg.input_app:
+                self._clear_keys()
+                self._skip(f"TV is showing '{name}', not {cfg.input_name.upper()} - leaving its volume alone")
+                return
+            if stale():
+                return  # an urgent power job is waiting; the keys stay queued
+            before = roku.audio_device(timeout=t)
+            sent = 0
+            while not stale():
+                with self.cv:
+                    if not self.keys:
+                        break
+                    key = self.keys.popleft()
+                if roku.keypress(key, timeout=t) == 202:
+                    self._clear_keys()
+                    self._skip("TV accepted but ignored a volume key (standby?) - volume changes are not sent")
+                    return
+                sent += 1
+                log.debug("sent %s", key)
+                if VOLUME_KEY_GAP_S:
+                    time.sleep(VOLUME_KEY_GAP_S)
+            if not sent or not _sleep_unless(VOLUME_SETTLE_S, stale):
+                return
+            after = roku.audio_device(timeout=t)
+        except EcpError as e:
+            self._clear_keys()
+            self._skip(f"TV volume not delivered ({_describe_power_mode_failure(e)}) - "
+                       "will retry at the next change")
+            return
+        self._vol_skip = None
+        log.info("TV volume %d%s -> %d%s (%d %s)", before[0], " muted" if before[1] else "",
+                 after[0], " muted" if after[1] else "", sent, "key" if sent == 1 else "keys")
 
 
 # ---------------------------------------------------------------------------
@@ -1990,6 +2443,7 @@ def cmd_status(args, cfg):
         if not s.connectors:
             print("  (no topology available - running without an interactive desktop?)")
         print(f"Roku monitor: {s.roku_name or 'not identified'}")
+        _print_windows_audio(s.roku_name)
     else:
         print(f"PC displays driven: {'YES' if s.pc_on else 'no'}")
         for c in s.connectors:
@@ -2014,14 +2468,38 @@ def cmd_status(args, cfg):
     print(f"Wanted input: {cfg.input_name.upper()} ({cfg.input_app}); "
           f"mirror rule: displays on -> TV on+{cfg.input_name.upper()}, displays off -> TV off"
           f"{' (only if on our input)' if cfg.only_off_when_on_input else ''}")
-    if not IS_WIN:
-        try:
-            vol, muted = roku.audio_device()
-            print(f"TV volume: {vol}{' (muted)' if muted else ''}; "
-                  f"volume mirror (ROKU_VOLUME): {'on' if cfg.volume else 'off'}")
-        except EcpError as e:
-            print(f"TV volume: not readable ({e}) - the volume mirror needs /query/audio-device")
+    try:
+        vol, muted = roku.audio_device()
+        print(f"TV volume: {vol}{' (muted)' if muted else ''}; "
+              f"volume mirror (ROKU_VOLUME): {'on' if cfg.volume else 'off'}")
+    except EcpError as e:
+        print(f"TV volume: not readable ({e}) - the volume mirror needs /query/audio-device")
     return 0
+
+
+def _print_windows_audio(roku_name):
+    """Windows: which output the volume keys currently belong to. Best effort -
+    a machine without the audio service just says so."""
+    try:
+        audio = core_audio()
+        default = audio.default_render()
+    except OSError as e:
+        print(f"Audio: not readable ({e})")
+        return
+    if default is None:
+        print("Audio: no default output device")
+        return
+    dev_id, name = default
+    if is_roku_endpoint(name, roku_name):
+        try:
+            level = audio.level(dev_id)
+        except OSError:
+            level = None
+        state = "level unknown" if level is None else \
+            f"{round(level[0] * 100)}% in Windows{' muted' if level[1] else ''}"
+        print(f"Default output: {name} ({state}) - the volume keys drive the TV when ROKU_VOLUME=true")
+    else:
+        print(f"Default output: {name} - not the Roku TV, so the volume keys stay with Windows")
 
 
 def _level(node):
@@ -2073,7 +2551,7 @@ def cmd_run(args, cfg):
     reconciler = Reconciler(roku, cfg)
     daemon = Daemon(cfg, make_sampler(cfg), reconciler)
     if cfg.volume and IS_WIN:
-        log.warning("ROKU_VOLUME=true is Linux-only (PipeWire) - ignored on Windows")
+        daemon.volume = WinVolume(reconciler, daemon.sampler)  # the hook starts in run_windows_loop
     elif cfg.volume:
         daemon.volume = VolumeWatcher(reconciler, daemon.stop_event)
         reconciler.pc_volume = daemon.volume.set_pc
