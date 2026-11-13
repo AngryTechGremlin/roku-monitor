@@ -3,6 +3,7 @@ everything CI can actually prove about the logic."""
 
 import io
 import json
+import logging
 import os
 import re
 import sys
@@ -53,10 +54,16 @@ class EnvFileTests(unittest.TestCase):
         cfg = rm.Config({"ROKU_TV_IP": "10.0.0.5", "ROKU_ONLY_OFF_WHEN_ON_INPUT": "yes"})
         self.assertEqual(cfg.input_key, "InputHDMI3")
         self.assertEqual(cfg.input_app, "tvinput.hdmi3")
-        self.assertTrue(cfg.only_off_when_on_input)
+        self.assertTrue(cfg.shared_tv)  # set here by the old key: the alias works
         self.assertTrue(cfg.off_on_sleep)
         self.assertEqual(cfg.off_delay_s, 10.0)
         self.assertEqual(cfg.poll_s, 1.0)
+
+    def test_shared_tv_knob_and_its_old_name(self):
+        base = {"ROKU_TV_IP": "192.0.2.40"}
+        self.assertFalse(rm.Config(base).shared_tv)
+        self.assertTrue(rm.Config({**base, "ROKU_SHARED_TV": "yes"}).shared_tv)
+        self.assertTrue(rm.Config({**base, "ROKU_ONLY_OFF_WHEN_ON_INPUT": "true"}).shared_tv)
 
     def test_bad_input_name(self):
         with self.assertRaises(rm.ConfigError):
@@ -84,6 +91,13 @@ class EcpParsingTests(unittest.TestCase):
     def test_active_app_input(self):
         xml = '<active-app><app id="tvinput.hdmi3" type="tvin" version="1.0.0">HDMI 3</app></active-app>'
         self.assertEqual(rm.parse_active_app(xml), ("tvinput.hdmi3", "HDMI 3"))
+
+    def test_active_app_home_with_an_id(self):
+        # Measured on Roku OS 15.3.4: this model gives its home screen a real
+        # app id, so "no id" alone does not identify an idle TV.
+        self.assertEqual(rm.parse_active_app(
+            '<active-app><app id="562859" type="home" ui-location="home">'
+            'Roku Dynamic Menu</app></active-app>'), (None, "Roku Dynamic Menu"))
 
     def test_active_app_screensaver_sibling(self):
         xml = ('<active-app><app>Roku</app>'
@@ -317,6 +331,278 @@ class WrongDeviceTests(unittest.TestCase):
     def test_unparseable_xml_is_ecp_error(self):
         with self.assertRaises(rm.EcpError):
             rm.parse_active_app("<active-app><app>Roku")
+
+
+class EnsureOnOffTests(unittest.TestCase):
+    """The shared-TV courtesy, both directions. Also the first coverage of
+    ensure_on's happy path and of the off-path guard."""
+
+    class FakeRoku:
+        """A TV that answers like a Roku and records what it was told."""
+
+        def __init__(self, mode="PowerOn", app="tvinput.hdmi3"):
+            self.mode, self.app = mode, app
+            self.keys, self.launched = [], []
+
+        def power_mode(self, timeout=None):
+            return self.mode
+
+        def active_app(self, timeout=None):
+            return self.app, "Roku" if self.app is None else "Some App"
+
+        def launch(self, app_id, timeout=None):
+            self.launched.append(app_id)
+            self.app = app_id
+
+        def keypress(self, key, timeout=None):
+            self.keys.append(key)
+            if key == "PowerOn":
+                self.mode = "PowerOn"   # a real TV lands on Home; this one does
+                                        # not, so a courtesy computed too late
+                                        # would wrongly fire and fail the test
+            elif key == "PowerOff":
+                self.mode = "Ready"
+            elif key.startswith("Input"):
+                self.app = "tvinput." + key[len("Input"):].lower()
+            return 200
+
+    def setUp(self):
+        # Nothing may sleep for real. Every fake here switches on the first
+        # try, so the 8 s verify loops exit immediately.
+        orig = rm._sleep_unless
+        setattr(rm, "_sleep_unless", lambda seconds, stale=lambda: False: not stale())
+        self.addCleanup(setattr, rm, "_sleep_unless", orig)
+
+    def cfg(self, **over):
+        return rm.Config({"ROKU_TV_IP": "192.0.2.40", **over})
+
+    def shared(self, **over):
+        return self.cfg(ROKU_SHARED_TV="true", **over)
+
+    # -- the predicate ------------------------------------------------------
+
+    def test_someone_watching_ignores_home_and_our_own_input(self):
+        cfg = self.cfg()
+        self.assertFalse(rm.someone_watching(cfg, None))              # Home
+        self.assertFalse(rm.someone_watching(cfg, "tvinput.hdmi3"))   # ours
+        self.assertTrue(rm.someone_watching(cfg, "tvinput.dtv"))      # live TV
+        self.assertTrue(rm.someone_watching(cfg, "12"))               # Netflix
+
+    # -- the on path --------------------------------------------------------
+
+    def test_on_happy_path_switches_the_input(self):
+        tv = self.FakeRoku(app="tvinput.dtv")           # knob off: today's steal
+        self.assertIs(rm.ensure_on(tv, self.cfg()), True)
+        self.assertEqual(tv.launched, ["tvinput.hdmi3"])
+
+    def test_on_already_on_our_input_sends_nothing(self):
+        tv = self.FakeRoku()
+        self.assertIs(rm.ensure_on(tv, self.shared()), True)
+        self.assertEqual((tv.keys, tv.launched), ([], []))
+
+    def test_on_powers_up_a_standby_tv_then_takes_the_input(self):
+        # A TV that was off belongs to nobody, whatever it shows on wake.
+        tv = self.FakeRoku(mode="Ready", app="tvinput.dtv")
+        self.assertIs(rm.ensure_on(tv, self.shared()), True)
+        self.assertIn("PowerOn", tv.keys)
+        self.assertEqual(tv.app, "tvinput.hdmi3")
+
+    def test_on_takes_a_tv_sitting_on_home(self):
+        tv = self.FakeRoku(app=None)
+        self.assertIs(rm.ensure_on(tv, self.shared()), True)
+        self.assertEqual(tv.launched, ["tvinput.hdmi3"])
+
+    def test_on_leaves_a_shared_tv_alone(self):
+        tv = self.FakeRoku(app="12")
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            self.assertIs(rm.ensure_on(tv, self.shared()), rm.SHARED)
+        self.assertEqual((tv.keys, tv.launched), ([], []))
+        self.assertTrue(any("ROKU_SHARED_TV" in m for m in cm.output))
+
+    def test_on_force_ignores_the_courtesy(self):
+        tv = self.FakeRoku(app="12")
+        self.assertIs(rm.ensure_on(tv, self.shared(), force=True), True)
+        self.assertEqual(tv.launched, ["tvinput.hdmi3"])
+
+    # -- the off path -------------------------------------------------------
+
+    def test_off_leaves_a_shared_tv_on(self):
+        tv = self.FakeRoku(app="12")
+        self.assertIs(rm.ensure_off(tv, self.shared()), True)
+        self.assertEqual(tv.keys, [])
+        self.assertEqual(tv.mode, "PowerOn")
+
+    def test_off_force_turns_a_shared_tv_off(self):
+        tv = self.FakeRoku(app="12")
+        self.assertIs(rm.ensure_off(tv, self.shared(), force=True), True)
+        self.assertIn("PowerOff", tv.keys)
+
+    def test_off_turns_off_a_tv_left_on_home(self):
+        # Home is nobody's, so the courtesy must not keep it burning.
+        tv = self.FakeRoku(app=None)
+        self.assertIs(rm.ensure_off(tv, self.shared()), True)
+        self.assertIn("PowerOff", tv.keys)
+
+
+class ShareGuardTests(unittest.TestCase):
+    """The interlock above all: never release the last driven output."""
+
+    class FakeDisplay:
+        def __init__(self, logicals=None, mode_of=None, vendor_of=None, refuse=False):
+            self.logicals = logicals if logicals is not None else [
+                (0, 0, 1.0, 0, False, [("HDMI-1", "", "", "")], {}),
+                (1920, 1055, 1.0, 0, True, [("DP-2", "", "", "")], {}),
+            ]
+            self.mode_of = mode_of or {"HDMI-1": "1920x1080@60", "DP-2": "2560x1440@60"}
+            self.vendor_of = vendor_of or {"HDMI-1": "RKU", "DP-2": "DEL"}
+            self.refuse = refuse
+            self.applied = []
+
+        def state(self):
+            return 7, self.logicals, self.mode_of, self.vendor_of
+
+        def apply(self, body, verify=False):
+            if self.refuse:
+                return False
+            self.applied.append(body)
+            return True
+
+    class FakeSampler:
+        def __init__(self, *driven):
+            self.driven = driven
+
+        def sample(self):
+            cons = [rm.Connector(n, "connected", "enabled", "On" if d else "Off")
+                    for n, d in self.driven]
+            return rm.Sample(any(c.driven for c in cons), "driven", "card1-HDMI-A-1", cons)
+
+    BOTH = (("card1-HDMI-A-1", True), ("card1-DP-2", True))
+    TV_ONLY = (("card1-HDMI-A-1", True),)
+
+    def guard(self, driven, **dkw):
+        cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_RELEASE_DISPLAY": "true"})
+        d = self.FakeDisplay(**dkw)
+        return rm.ShareGuard(cfg, self.FakeSampler(*driven), d), d
+
+    def test_release_drops_the_tv_and_renormalises_to_the_origin(self):
+        g, d = self.guard(self.BOTH)
+        self.assertTrue(g.release("Netflix"))
+        self.assertEqual(len(d.applied), 1)
+        body = d.applied[0]
+        self.assertEqual([m[0] for l in body for m in l[5]], ["DP-2"])
+        self.assertEqual((body[0][0], body[0][1]), (0, 0))  # Mutter rejects an offset layout
+
+    def test_interlock_refuses_when_the_tv_is_the_only_screen(self):
+        g, d = self.guard(self.TV_ONLY)
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            self.assertFalse(g.release("Netflix"))
+        self.assertEqual(d.applied, [])       # nothing touched
+        self.assertIsNone(g.released)
+        self.assertTrue(any("only screen" in m for m in cm.output))
+
+    def test_restore_puts_the_original_layout_back(self):
+        g, d = self.guard(self.BOTH)
+        g.release("Netflix")
+        self.assertTrue(g.restore("the TV is ours again"))
+        self.assertEqual([m[0] for l in d.applied[-1] for m in l[5]], ["HDMI-1", "DP-2"])
+        self.assertIsNone(g.released)
+
+    def test_restore_is_a_no_op_when_nothing_was_released(self):
+        g, d = self.guard(self.BOTH)
+        self.assertTrue(g.restore("displays off"))
+        self.assertEqual(d.applied, [])
+
+    def test_release_is_idempotent(self):
+        g, d = self.guard(self.BOTH)
+        g.release("Netflix")
+        g.release("Netflix")
+        self.assertEqual(len(d.applied), 1)
+
+    def test_on_app_releases_for_a_watcher_and_restores_for_home(self):
+        g, d = self.guard(self.BOTH)
+        g.on_app("12", "Netflix")
+        self.assertIsNotNone(g.released)
+        g.on_app(None, "Roku Dynamic Menu")   # home: nobody's
+        self.assertIsNone(g.released)
+        g.on_app("tvinput.hdmi3", "HDMI 3")   # ours
+        self.assertIsNone(g.released)
+        self.assertEqual(len(d.applied), 2)   # released once, restored once
+
+    def test_a_refusing_compositor_leaves_us_holding_nothing(self):
+        g, d = self.guard(self.BOTH, refuse=True)
+        self.assertFalse(g.release("Netflix"))
+        self.assertIsNone(g.released)         # never claim a release that did not happen
+
+    def test_no_roku_in_the_layout_is_left_alone(self):
+        g, d = self.guard(self.BOTH, vendor_of={"HDMI-1": "SAM", "DP-2": "DEL"})
+        self.assertFalse(g.release("Netflix"))
+        self.assertEqual(d.applied, [])
+
+    def test_windows_can_not_turn_it_on(self):
+        orig = rm.IS_WIN
+        setattr(rm, "IS_WIN", True)
+        self.addCleanup(setattr, rm, "IS_WIN", orig)
+        cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_RELEASE_DISPLAY": "true"})
+        self.assertFalse(cfg.release_display)
+
+    def test_release_display_implies_shared_tv(self):
+        cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_RELEASE_DISPLAY": "true"})
+        self.assertTrue(cfg.shared_tv)
+
+
+class ReconcilerShareTests(unittest.TestCase):
+    def test_share_check_reports_and_never_retries(self):
+        seen, cfg = [], rm.Config({"ROKU_TV_IP": "192.0.2.40"})
+        tv = ReconcilerVolumeTests.FakeRoku(app="12")
+        rec = rm.Reconciler(tv, cfg)
+        rec.share_cb = lambda app_id, name: seen.append((app_id, name))
+        rec._reconcile_share()
+        self.assertEqual(seen, [("12", "Some App")])
+
+    def test_an_unreachable_tv_changes_nothing(self):
+        seen, cfg = [], rm.Config({"ROKU_TV_IP": "192.0.2.40"})
+        tv = ReconcilerVolumeTests.FakeRoku()
+        tv.fail = rm.EcpUnreachable("no route")
+        rec = rm.Reconciler(tv, cfg)
+        rec.share_cb = lambda app_id, name: seen.append((app_id, name))
+        with self.assertLogs(rm.log, level="INFO"):
+            rec._reconcile_share()
+        self.assertEqual(seen, [])            # the output is left exactly as it is
+
+    def test_power_still_outranks_a_share_check(self):
+        cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40"})
+        rec = rm.Reconciler(ReconcilerVolumeTests.FakeRoku(), cfg)
+        with rec.cv:
+            rec.request_share()
+            rec.request(rm.ON)
+            self.assertIsNotNone(rec.target)  # power is picked first by run()
+            self.assertTrue(rec.share)
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        # main() calls _setup_logging, whose basicConfig attaches a stderr
+        # handler to the root logger and would make the rest of the run noisy.
+        root = logging.getLogger()
+        handlers, level = root.handlers[:], root.level
+        def restore():
+            root.handlers[:] = handlers
+            root.setLevel(level)
+        self.addCleanup(restore)
+
+    def test_on_and_off_both_accept_force(self):
+        seen = {}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "env")
+            with io.open(path, "w", encoding="utf-8") as f:
+                f.write("ROKU_TV_IP=192.0.2.40\n")
+            for cmd in ("on", "off"):
+                orig = getattr(rm, "cmd_" + cmd)
+                setattr(rm, "cmd_" + cmd,
+                        lambda args, cfg, c=cmd: seen.__setitem__(c, args.force) or 0)
+                self.addCleanup(setattr, rm, "cmd_" + cmd, orig)
+                rm.main(["--config", path, cmd, "--force"])
+        self.assertEqual(seen, {"on": True, "off": True})
 
 
 class WindowsLogicTests(unittest.TestCase):
@@ -937,6 +1223,30 @@ class ReconcilerVolumeTests(unittest.TestCase):
         # power first; then the TV wins at power-on (the stale 20% is not sent)
         self.assertEqual(order, ["power", ("sync", 15, False)])
         self.assertEqual(tv.keys, [])
+
+    def test_shared_tv_stops_the_ladder_and_leaves_the_mirror_off(self):
+        calls = []
+        rec = self.make(self.FakeRoku(), tv_on=True)
+        orig_on = rm.ensure_on
+        setattr(rm, "ensure_on", lambda roku, cfg, stale=None: calls.append(1) or rm.SHARED)
+        self.addCleanup(setattr, rm, "ensure_on", orig_on)
+        rec._reconcile(rm.ON, urgent=False, stale=lambda: False)
+        self.assertEqual(len(calls), 1)     # not the whole ON_LADDER at a TV in use
+        self.assertFalse(rec.tv_on)         # the volume mirror stays out of it
+        self.assertIsNone(rec.volume)       # and no SYNC was queued
+
+    def test_a_failed_on_still_walks_the_ladder(self):
+        calls = []
+        rec = self.make(self.FakeRoku(), tv_on=False)
+        orig_ladder, orig_on = rm.ON_LADDER, rm.ensure_on
+        setattr(rm, "ON_LADDER", (0, 0))
+        setattr(rm, "ensure_on", lambda roku, cfg, stale=None: calls.append(1) or False)
+        self.addCleanup(setattr, rm, "ON_LADDER", orig_ladder)
+        self.addCleanup(setattr, rm, "ensure_on", orig_on)
+        with self.assertLogs(rm.log, level="INFO") as cm:
+            rec._reconcile(rm.ON, urgent=False, stale=lambda: False)
+        self.assertEqual(len(calls), 2)     # a real failure is still retried
+        self.assertTrue(any("giving up" in m for m in cm.output))
 
     def test_off_clears_tv_on_and_on_requests_sync(self):
         class Quiet(self.FakeRoku):

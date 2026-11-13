@@ -142,7 +142,9 @@ ones that matter:
 | `ROKU_TV_MAC` | — | Best-effort Wake-on-LAN if the TV went to deep sleep. Not a substitute for Fast TV start. |
 | `ROKU_INPUT` | `hdmi3` | Which TV input the PC is on (`hdmi1..4`, `av1`, `tuner`). |
 | `ROKU_CONNECTOR` | auto | *Linux only.* The PC's output that feeds the TV. Found automatically from the TV's EDID (vendor `RKU`); override with e.g. `HDMI-A-1` if you must. |
-| `ROKU_ONLY_OFF_WHEN_ON_INPUT` | `false` | Opt-in courtesy for a *shared* TV: don't turn it off if it is showing something other than the PC's input when the PC blanks. Off by default — the TV is your monitor. |
+| `ROKU_SHARED_TV` | `false` | Opt-in courtesy for a *shared* TV, both directions: while someone else is watching it, don't turn it off when the PC blanks and don't switch its input away when the PC wakes. A TV on its Home screen or a screensaver belongs to nobody and is treated normally. Off by default — the TV is your monitor. Trade-off: the daemon never re-asserts on a schedule, so it does not take the screen back on its own; lock/unlock or run `roku-monitor on --force`. `ROKU_ONLY_OFF_WHEN_ON_INPUT` is the old name and is still read. |
+| `ROKU_RELEASE_DISPLAY` | `false` | *Linux + GNOME only.* While someone else is using the TV, stop driving its output as well, so the desktop does not extend onto a screen you cannot see and the pointer cannot drift into it. Implies `ROKU_SHARED_TV`. Trade-off: it is a layout change, so GNOME moves windows off the TV and does not move them back; it needs `python3-gi`; and it is inert when the TV is the PC's only screen. |
+| `ROKU_SHARE_POLL_S` | `20` | Only with `ROKU_RELEASE_DISPLAY`. How often to ask the TV what it is showing, while the displays are on. The daemon's only periodic call to the TV; `0` turns it off. |
 | `ROKU_OFF_ON_SLEEP` / `ROKU_OFF_ON_STOP` | `true` | Turn the TV off before suspend / when the service stops (logout, `systemctl --user stop`). A `restart` is a stop+start, so expect a brief TV off/on blink; set `ROKU_OFF_ON_STOP=false` if that bothers you. |
 | `ROKU_OFF_DELAY_S` | `10` | Grace after the displays go dark; cancelled if they light up again. Absorbs "blank, then you touch the mouse". |
 | `ROKU_POWERON_TIMEOUT_S` | `45` | How long to wait for the TV to report it is on (a cold boot is ~30 s). |
@@ -156,7 +158,7 @@ ones that matter:
 | `roku-monitor discover` | SSDP scan; lists Rokus with name, kind, serial, MAC, power state. |
 | `roku-monitor discover --ip <tv-ip>` | Read one TV directly, for networks that block multicast. |
 | `roku-monitor status` | What the daemon sees: the display state, which monitor is the Roku, the TV's power mode + active input, the TV's volume, and the audio side (Linux: which sink feeds the TV and whether the "Roku TV" output is the default; Windows: which output the volume keys currently belong to). |
-| `roku-monitor on` | One-shot "TV on + input" (exit 1 if it could not). |
+| `roku-monitor on [--force]` | One-shot "TV on + input" (exit 1 if it could not, *including* when `ROKU_SHARED_TV` left a TV someone else is watching alone). `--force` takes it anyway — this is how you get the screen back mid-show. |
 | `roku-monitor off [--force]` | One-shot TV off (`--force` ignores the shared-TV guard). |
 
 On Windows, run these as `python roku_monitor.py <command>` from the repo
@@ -268,7 +270,9 @@ every successful "TV on" (i.e. every unblank), the "Roku TV" output
 blasts a quiet room at login and bounds any drift from the remote; there is no
 periodic polling of the TV (the README's "never re-asserts on a schedule" rule
 holds for volume too). Volume is only ever sent while the last "TV on" succeeded
-*and* the TV is showing the PC's input — a shared TV on Live TV is left alone —
+*and* the TV is showing the PC's input — a shared TV on Live TV is left alone,
+and one the daemon deliberately stood aside from (`ROKU_SHARED_TV`) counts as
+not ours —
 and a volume key the TV merely *accepts* (HTTP 202, standby) stops the job.
 All volume work runs on the same reconciler thread as power, power first, with
 short timeouts (1 s) and one attempt per change, so it can never hold up the
@@ -363,6 +367,28 @@ next edge; it never loops at a TV that will not answer, and it never
 re-asserts on a schedule (if you turn the TV off by hand while the PC is
 awake, it stays off until the displays change state).
 
+**Releasing the output** (`ROKU_RELEASE_DISPLAY`, Linux + GNOME). Measured on
+a Roku TV: it keeps HDMI hot-plug asserted while showing another input, so the
+connector still reads `connected/enabled/On` and the PC goes on driving a screen
+displaying somebody else's show. The kernel will not help here, since
+`/sys/class/drm/*/{dpms,enabled}` are read-only even to root, so under Wayland
+only the compositor can stop it. This is the one place the daemon talks to a
+desktop environment, and only to *act*: the truth is still the kernel's, Mutter
+is just the actuator, and the layout is applied as *temporary* so
+`~/.config/monitors.xml` is never rewritten and logging out undoes everything.
+The interlock is absolute: it never releases the last driven output, because on
+a machine where the TV is the only screen that would leave the PC with nothing
+to draw on and then trip the displays-off rule against a TV somebody is
+watching. The output comes back when the TV returns to your input, when the
+displays go dark, and when the daemon stops.
+
+With `ROKU_SHARED_TV=true` an ON edge has a third outcome besides done and
+failed: *left it alone*, when the TV was already on with someone else's app.
+That is not a failure, so it ends the ladder immediately rather than poking a
+TV somebody is using six more times, and it leaves the volume mirror off. Why
+it is opt-in: the cost is that nothing brings that screen back automatically
+(see the trade-off in the config table).
+
 **Suspend and shutdown.** On Linux, with `python3-gi`, the daemon holds a
 login1 *delay* inhibitor and turns the TV off the moment `PrepareForSleep` /
 `PrepareForShutdown` fires — before NetworkManager takes the Wi-Fi down — then
@@ -400,6 +426,9 @@ corrected the next time the displays come back.
   placeholders. Did you run `install.sh` from inside a desktop session?
 - **My windows jumped to the other monitor** → the TV dropped hot-plug while
   off; see *How it works* and the CEC tip.
+- **The TV stayed on someone else's show when I sat down** → expected with
+  `ROKU_SHARED_TV=true`; the daemon stood aside and will not take the screen
+  back by itself. Run `roku-monitor on --force`, or lock and unlock the PC.
 - **Roku connector "not found"** (Linux) → the TV is off or on another input
   (its EDID is not readable then) — normal; it is cached once seen. If it is
   never found, set `ROKU_CONNECTOR`.

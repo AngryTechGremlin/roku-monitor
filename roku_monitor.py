@@ -59,6 +59,10 @@ ECP_PORT = 8060
 EX_CONFIG = 78  # sysexits.h: a config problem a restart cannot fix
 SYS_DRM = "/sys/class/drm"
 ON, OFF = "ON", "OFF"
+# A third ensure_on() outcome: the TV was already on with someone else's app and
+# the shared-TV courtesy left it alone. Truthy, so always test it with `is` -
+# a bare `if ensure_on(...)` would read it as success.
+SHARED = "SHARED"
 IS_WIN = sys.platform == "win32"
 # How long the pre-suspend/stop off may take. Windows allows only ~2 s at
 # PBT_APMSUSPEND and offers no delay-inhibitor equivalent to logind's.
@@ -71,6 +75,8 @@ PW_RELAY_CAPTURE = "roku-tv-relay.capture"  # loopback: PW_SINK monitor -> ...
 PW_RELAY_PLAYBACK = "roku-tv-relay.playback"  # ... -> the real HDMI sink (target.object)
 SYNC = "SYNC"              # reconciler job: PC slider := TV volume ("TV wins")
 KEYS = "KEYS"              # reconciler job: drain the Windows key queue to the TV
+SHARE = "SHARE"            # reconciler job: read who the TV is showing, then decide
+                           # whether to keep driving its output (ROKU_RELEASE_DISPLAY)
 VOLUME_ROUNDS = 3          # per job: send keys, re-read the TV, correct; then give up
 VOLUME_KEY_GAP_S = 0.0     # measured: 20 keypresses back to back, none dropped (~40 ms each)
 VOLUME_SETTLE_S = 0.1      # the TV reports the new value at once; a small margin anyway
@@ -96,7 +102,10 @@ DEFAULTS = {
     "ROKU_TV_MAC": "",
     "ROKU_INPUT": "hdmi3",
     "ROKU_CONNECTOR": "",
-    "ROKU_ONLY_OFF_WHEN_ON_INPUT": "false",
+    "ROKU_SHARED_TV": "false",
+    "ROKU_RELEASE_DISPLAY": "false",
+    "ROKU_SHARE_POLL_S": "20",
+    "ROKU_ONLY_OFF_WHEN_ON_INPUT": "false",  # the old name for ROKU_SHARED_TV
     "ROKU_OFF_ON_SLEEP": "true",
     "ROKU_OFF_ON_STOP": "true",
     "ROKU_POLL_S": "1",
@@ -195,7 +204,18 @@ class Config:
         self.input_name = v["ROKU_INPUT"]
         self.input_key, self.input_app = input_spec(self.input_name)
         self.connector = v["ROKU_CONNECTOR"]
-        self.only_off_when_on_input = _as_bool(v["ROKU_ONLY_OFF_WHEN_ON_INPUT"])
+        # One courtesy, both directions: do not switch a shared TV off, and do
+        # not switch its input away, while someone else is watching it.
+        # ROKU_ONLY_OFF_WHEN_ON_INPUT is the old name and is still honoured, so
+        # an existing config file does not silently lose the setting.
+        self.shared_tv = (_as_bool(v["ROKU_SHARED_TV"])
+                          or _as_bool(v["ROKU_ONLY_OFF_WHEN_ON_INPUT"]))
+        # Releasing the output is the shared-TV courtesy taken one step further,
+        # so it implies it: there is no sense in dropping the picture we are
+        # about to steal back.
+        self.release_display = _as_bool(v["ROKU_RELEASE_DISPLAY"]) and not IS_WIN
+        if self.release_display:
+            self.shared_tv = True
         self.off_on_sleep = _as_bool(v["ROKU_OFF_ON_SLEEP"])
         self.off_on_stop = _as_bool(v["ROKU_OFF_ON_STOP"])
         try:
@@ -203,6 +223,7 @@ class Config:
             self.off_delay_s = max(0.0, float(v["ROKU_OFF_DELAY_S"]))
             self.ecp_timeout = max(0.5, float(v["ROKU_ECP_TIMEOUT_S"]))
             self.poweron_timeout = max(5.0, float(v["ROKU_POWERON_TIMEOUT_S"]))
+            self.share_poll_s = max(0.0, float(v["ROKU_SHARE_POLL_S"]))
         except ValueError as e:
             raise ConfigError(f"numeric setting is not a number: {e}")
         self.wol_broadcast = v["ROKU_WOL_BROADCAST"]
@@ -1131,14 +1152,24 @@ def parse_device_info(xml_text):
 def parse_active_app(xml_text):
     """Returns (app_id or None, name). Shapes seen on Roku OS 15:
     <active-app><app>Roku</app></active-app>                         (home)
+    <active-app><app id="562859" type="home">Roku Dynamic Menu</app>  (home, with an id)
     <active-app><app id="tvinput.hdmi3" type="tvin">HDMI 3</app>…    (input)
     …<screensaver id="55545" type="ssvr">Roku City</screensaver>     (sibling)
+
+    Some models report the home screen with no id at all and others with a real
+    id plus type="home" (measured on Roku OS 15.3.4). Both mean the same thing:
+    the TV is idle and belongs to nobody. Collapsing the second shape onto the
+    first here means someone_watching() and every other caller only ever has to
+    understand "no id = nobody".
     """
     root = _xml(xml_text)
     app = root.find("app")
     if app is None:
         return None, "Unknown"
-    return app.get("id"), (app.text or "").strip() or "Unknown"
+    name = (app.text or "").strip() or "Unknown"
+    if app.get("type") == "home":
+        return None, name
+    return app.get("id"), name
 
 
 def parse_apps(xml_text):
@@ -1307,6 +1338,14 @@ def ssdp_discover(timeout=4.0):
 # The two routines: "TV on and on our input" and "TV off"
 # ---------------------------------------------------------------------------
 
+def someone_watching(cfg, app_id):
+    """The shared-TV courtesy's one question, asked on both the on and the off
+    path. Home and the screensaver report no app id at all (see
+    parse_active_app), i.e. an idle TV that belongs to nobody; any other id
+    that is not ours is a person watching something."""
+    return app_id is not None and app_id != cfg.input_app
+
+
 def _sleep_unless(seconds, stale):
     end = time.monotonic() + seconds
     while time.monotonic() < end:
@@ -1326,8 +1365,14 @@ def _describe_power_mode_failure(exc):
     return str(exc)
 
 
-def ensure_on(roku, cfg, stale=lambda: False):
-    """One attempt. Returns True when the TV is on and showing cfg.input_app."""
+def ensure_on(roku, cfg, stale=lambda: False, force=False):
+    """One attempt. Three outcomes:
+
+    True    the TV is on and showing cfg.input_app - it is ours.
+    SHARED  the TV was already on with someone else's app and the shared-TV
+            courtesy left it alone. Not a failure: nothing to retry.
+    False   it could not be done; the caller's ladder decides what happens next.
+    """
     try:
         mode = roku.power_mode()
     except EcpUnreachable as e:
@@ -1338,6 +1383,12 @@ def ensure_on(roku, cfg, stale=lambda: False):
     except EcpError as e:
         log.warning("%s", _describe_power_mode_failure(e))
         return False
+
+    # The courtesy covers only a TV that was already on when we got here. One we
+    # power on ourselves comes up on its Home screen and belongs to nobody, so
+    # there we always take our input. Read this before the block below moves
+    # `mode` on. An unreachable TV (mode None) is nobody's either.
+    courtesy = mode == "PowerOn" and cfg.shared_tv and not force
 
     if mode != "PowerOn":
         if cfg.mac:
@@ -1382,6 +1433,11 @@ def ensure_on(roku, cfg, stale=lambda: False):
             if app_id == cfg.input_app:
                 log.info("TV is on %s (%s)", cfg.input_name.upper(), name)
                 return True
+            if courtesy and someone_watching(cfg, app_id):
+                log.info("TV is on '%s' (%s), not %s - leaving it alone "
+                         "(ROKU_SHARED_TV); 'roku-monitor on --force' takes it",
+                         name, app_id, cfg.input_name.upper())
+                return SHARED
             log.info("TV is on '%s' - switching to %s", name, cfg.input_name.upper())
             if attempt == 0:
                 roku.launch(cfg.input_app)
@@ -1432,15 +1488,15 @@ def ensure_off(roku, cfg, stale=lambda: False, force=False, urgent=False):
     if mode != "PowerOn":
         log.info("TV already off (%s)", mode)
         return True
-    if cfg.only_off_when_on_input and not force:
+    if cfg.shared_tv and not force:
         try:
             app_id, name = roku.active_app(timeout=t)
         except EcpError as e:
             log.warning("could not read active app (%s) - leaving the TV on", e)
             return True
-        if app_id != cfg.input_app:
-            log.info("TV is on '%s' (%s), not %s - leaving it on (ROKU_ONLY_OFF_WHEN_ON_INPUT)",
-                     name, app_id or "no id", cfg.input_name.upper())
+        if someone_watching(cfg, app_id):
+            log.info("TV is on '%s' (%s), not %s - leaving it on (ROKU_SHARED_TV)",
+                     name, app_id, cfg.input_name.upper())
             return True
     try:
         roku.keypress("PowerOff", timeout=t)
@@ -1861,6 +1917,192 @@ class VolumeWatcher(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Display release (Linux + GNOME, optional): stop driving an output nobody
+# can see
+#
+# Measured: a Roku TV keeps HDMI hot-plug asserted while it is showing another
+# input, so the connector still reads connected/enabled/On and the desktop
+# still extends onto a screen that is displaying somebody else's show. The
+# pointer and windows wander off into it.
+#
+# The kernel will not help: /sys/class/drm/*/{dpms,enabled} are read-only even
+# to root. Under Wayland only the compositor can change what is driven, so this
+# is the one place the daemon talks to a desktop environment - and only to
+# *act*, never to decide. The truth is still the kernel's (DisplaySampler);
+# Mutter is just the actuator, and the whole section is inert unless
+# ROKU_RELEASE_DISPLAY is set.
+# ---------------------------------------------------------------------------
+
+MUTTER = ("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig")
+STATE_SIG = "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
+APPLY_SIG = "(uua(iiduba(ssa{sv}))a{sv})"
+APPLY_VERIFY, APPLY_TEMPORARY = 0, 1  # 2 would rewrite ~/.config/monitors.xml
+
+
+class MutterDisplay:
+    """Mutter's monitor layout, as much of it as this daemon needs.
+
+    `gi` stays a lazy import: CI has no python3-gi and neither do the tests.
+    Every method returns None/False rather than raising, so a session without
+    GNOME simply never releases anything.
+    """
+
+    def __init__(self):
+        self._bus = None
+        self._glib = None
+
+    def connect(self):
+        if self._bus is not None:
+            return True
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+        except (ImportError, ValueError) as e:
+            log.warning("ROKU_RELEASE_DISPLAY needs python3-gi (%s) - the output is never released", e)
+            return False
+        try:
+            self._bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception as e:  # GLib.Error, and anything else a broken session throws
+            log.warning("no session bus (%s) - the output is never released", e)
+            return False
+        self._glib, self._gio = GLib, Gio
+        return True
+
+    def _call(self, method, args, ret_sig):
+        return self._bus.call_sync(MUTTER[0], MUTTER[1], MUTTER[0], method, args,
+                                   self._glib.VariantType(ret_sig) if ret_sig else None,
+                                   self._gio.DBusCallFlags.NONE, 5000, None)
+
+    def state(self):
+        """(serial, logical_monitors, mode_of, vendor_of) or None."""
+        if not self.connect():
+            return None
+        try:
+            serial, monitors, logicals, _props = self._call("GetCurrentState", None, STATE_SIG).unpack()
+        except Exception as e:
+            log.warning("cannot read the monitor layout (%s)", e)
+            return None
+        mode_of, vendor_of = {}, {}
+        for spec, modes, _p in monitors:
+            vendor_of[spec[0]] = spec[1]
+            for m in modes:
+                if m[6].get("is-current"):
+                    mode_of[spec[0]] = m[0]
+        return serial, logicals, mode_of, vendor_of
+
+    @staticmethod
+    def body(logicals, mode_of):
+        """Mutter's logical monitors in the shape ApplyMonitorsConfig wants.
+
+        The layout must start at the origin: dropping the left-hand monitor and
+        leaving the rest where they were is rejected with "Logical monitors
+        positions are offset", so shift everything back.
+        """
+        if not logicals:
+            return []
+        minx = min(l[0] for l in logicals)
+        miny = min(l[1] for l in logicals)
+        out = []
+        for x, y, scale, transform, primary, mons, _p in logicals:
+            spec = [(m[0], mode_of[m[0]], {}) for m in mons if m[0] in mode_of]
+            if not spec:
+                return []  # a monitor we cannot name a mode for: do not guess
+            out.append((x - minx, y - miny, scale, transform, primary, spec))
+        return out
+
+    def apply(self, body, verify=False):
+        st = self.state()
+        if st is None or not body:
+            return False
+        serial = st[0]
+        method = APPLY_VERIFY if verify else APPLY_TEMPORARY
+        try:
+            self._call("ApplyMonitorsConfig",
+                       self._glib.Variant(APPLY_SIG, (serial, method, body, {})), None)
+            return True
+        except Exception as e:
+            log.warning("Mutter refused the monitor layout (%s)", e)
+            return False
+
+
+class ShareGuard:
+    """Owns the "is the TV ours, and should we be driving its output" decision.
+
+    The interlock is the whole point: never release the last driven output. On
+    a machine where the TV *is* the only screen, releasing it would leave the
+    PC with nothing to draw on and - because "displays on" means any connector
+    driven - would then trip the displays-off rule and power off a TV somebody
+    is watching. There, this feature does nothing at all.
+    """
+
+    def __init__(self, cfg, sampler, display=None):
+        self.cfg, self.sampler = cfg, sampler
+        self.display = display if display is not None else MutterDisplay()
+        self.released = None   # the layout to put back, or None while we hold it
+        self._why = None       # last refusal, logged once per streak
+
+    def _note(self, why):
+        if why != self._why:
+            log.info("%s", why)
+            self._why = why
+
+    def _others_driven(self):
+        """Is anything other than the TV's connector being driven right now?"""
+        s = self.sampler.sample()
+        return any(c.driven and c.name != s.roku_name for c in s.connectors)
+
+    def on_app(self, app_id, name):
+        """One decision, from the reconciler thread, after one active-app read."""
+        if someone_watching(self.cfg, app_id):
+            self.release(name)
+        else:
+            self.restore("the TV is ours again")
+
+    def release(self, name):
+        if self.released is not None:
+            return True                      # already stood down
+        if not self._others_driven():
+            self._note("TV is showing '%s' but it is the only screen this PC has - "
+                       "keeping its output (ROKU_RELEASE_DISPLAY cannot apply here)" % name)
+            return False
+        st = self.display.state()
+        if st is None:
+            return False
+        serial, logicals, mode_of, vendor_of = st
+        keep = [l for l in logicals if not any(vendor_of.get(m[0]) == "RKU" for m in l[5])]
+        if len(keep) == len(logicals):
+            self._note("no Roku output in the monitor layout - nothing to release")
+            return False
+        if not keep:
+            return False                     # belt and braces: never release them all
+        before = self.body(logicals, mode_of)
+        after = self.body(keep, mode_of)
+        if not after or not before:
+            return False
+        if not self.display.apply(after):
+            return False
+        self.released = before
+        self._why = None
+        log.info("TV is showing '%s' - released its output; the desktop no longer "
+                 "extends onto a screen you cannot see", name)
+        return True
+
+    def restore(self, why):
+        if self.released is None:
+            return True
+        body, self.released = self.released, None
+        if self.display.apply(body):
+            log.info("%s - the TV's output is back", why)
+            return True
+        log.warning("could not put the TV's output back (%s); GNOME Settings will, "
+                    "and so will logging out", why)
+        return False
+
+    body = staticmethod(MutterDisplay.body)
+
+
+# ---------------------------------------------------------------------------
 # Reconciler: one worker thread owns all TV I/O; bounded retries, never loops
 # ---------------------------------------------------------------------------
 
@@ -1887,6 +2129,8 @@ class Reconciler(threading.Thread):
         self.tv_on = False       # the last ensure_on() succeeded: on and on our input
         self.pc_volume = pc_volume  # callable(pct, muted) -> bool that sets the PC slider
         self.keys = collections.deque()  # Windows: swallowed volume keys, forwarded in order
+        self.share = False       # a "who is the TV showing" check is due (lowest priority)
+        self.share_cb = None     # callable(app_id, name), set when ROKU_RELEASE_DISPLAY is on
         self._vol_skip = None    # why the last PC -> TV job was dropped (logged once per streak)
 
     def request(self, target, urgent=False):
@@ -1918,13 +2162,21 @@ class Reconciler(threading.Thread):
                 return
             self.cv.notify()
 
+    def request_share(self):
+        """Lowest-priority job: one read, latest-wins, dropped if one is already
+        pending. Never touches `done` - that belongs to the power path."""
+        with self.cv:
+            self.share = True
+            self.cv.notify()
+
     def wait_done(self, timeout):
         return self.done.wait(timeout)
 
     def run(self):
         while True:
             with self.cv:
-                while self.target is None and self.volume is None and not self.keys:
+                while (self.target is None and self.volume is None
+                       and not self.keys and not self.share):
                     self.cv.wait()
                 if self.target is not None:  # power first: it is what the rule is about
                     target, urgent, gen = self.target, self.urgent, self.gen
@@ -1933,8 +2185,17 @@ class Reconciler(threading.Thread):
                 elif self.volume is not None:
                     want, vgen, gen = self.volume, self.vgen, self.gen
                     self.volume = None
-                else:
+                elif self.keys:
                     want, vgen, gen = KEYS, self.vgen, self.gen
+                else:
+                    self.share = False
+                    want, vgen, gen = SHARE, self.vgen, self.gen
+            if want is SHARE:
+                try:
+                    self._reconcile_share()
+                except Exception:
+                    log.exception("share check failed")
+                continue
             if want is KEYS:
                 try:
                     self._reconcile_keys(lambda: self.gen != gen)
@@ -1976,7 +2237,13 @@ class Reconciler(threading.Thread):
                 return
             if stale():
                 return
-            if ensure_on(self.roku, self.cfg, stale):
+            got = ensure_on(self.roku, self.cfg, stale)
+            if got is SHARED:
+                # Someone else is watching. The TV is on, it is just not ours:
+                # nothing to retry, and the volume mirror must stay out of it.
+                self.tv_on = False
+                return
+            if got:
                 self.tv_on = True
                 if self.pc_volume is not None:
                     self.request_volume(SYNC)  # TV wins at power-on: the slider adopts the TV
@@ -2052,6 +2319,21 @@ class Reconciler(threading.Thread):
             log.info("TV volume %d%s -> %d%s", start[0], " muted" if start[1] else "",
                      tv_vol, " muted" if tv_muted else "")
 
+    def _reconcile_share(self):
+        """One short read of what the TV is showing, then hand the answer to the
+        guard. No retry: a TV that will not answer is left exactly as it is and
+        the next tick asks again."""
+        if self.share_cb is None:
+            return
+        try:
+            app_id, name = self.roku.active_app(timeout=VOLUME_TIMEOUT_S)
+        except EcpError as e:
+            self._skip(f"cannot read what the TV is showing ({e}) - "
+                       "its output is left as it is")
+            return
+        self._vol_skip = None
+        self.share_cb(app_id, name)
+
     def _clear_keys(self):
         with self.cv:
             self.keys.clear()
@@ -2111,6 +2393,8 @@ class Daemon:
     def __init__(self, cfg, sampler, reconciler, volume=None):
         self.cfg, self.sampler, self.reconciler = cfg, sampler, reconciler
         self.volume = volume       # VolumeWatcher (Linux, ROKU_VOLUME=true) or None
+        self.guard = None          # ShareGuard (Linux, ROKU_RELEASE_DISPLAY=true) or None
+        self.next_share = 0.0
         self.committed = None      # what we last asked the TV to be
         self.off_samples = 0
         self.off_deadline = None
@@ -2152,6 +2436,11 @@ class Daemon:
                 self.off_deadline = None
             if self.committed != ON:
                 self._commit(ON, "displays on")
+            # Only while the displays are on: that is the only time an output we
+            # are needlessly driving can cost anything.
+            if self.guard is not None and self.cfg.share_poll_s and now >= self.next_share:
+                self.next_share = now + self.cfg.share_poll_s
+                self.reconciler.request_share()
         else:
             if self.committed == OFF:
                 return
@@ -2164,6 +2453,8 @@ class Daemon:
                 self._commit(OFF, "displays still off")
 
     def _commit(self, target, why):
+        if target == OFF and self.guard is not None:
+            self.guard.restore("displays off")  # never leave the desktop short a screen
         self.committed = target
         log.info("%s -> TV %s", why, "on + " + self.cfg.input_name.upper() if target == ON else "off")
         self.reconciler.request(target)
@@ -2189,6 +2480,8 @@ class Daemon:
             log.info("%s: TV was turned off moments ago, nothing to do", why)
             return
         self.off_deadline = None
+        if self.guard is not None:
+            self.guard.restore(why)
         self.committed = OFF
         self.reconciler.request(OFF, urgent=True)
         if not self.reconciler.wait_done(URGENT_OFF_BUDGET):
@@ -2197,6 +2490,11 @@ class Daemon:
     def on_term(self):
         if self.volume is not None:
             self.volume.stop()  # first: no volume job belongs in a shutdown
+        if self.guard is not None:
+            # Unconditionally, and before anything that might not happen: the
+            # daemon must never exit leaving the desktop a screen short, whatever
+            # ROKU_OFF_ON_STOP says and whether or not a shutdown is in flight.
+            self.guard.restore("daemon stopping")
         if not self.stop_event.is_set():
             if self.shutdown_seen:
                 log.info("SIGTERM during shutdown - already handled")
@@ -2467,7 +2765,13 @@ def cmd_status(args, cfg):
           f"active app '{name}' ({app_id or 'no id'}){' = our input' if on_input else ''}")
     print(f"Wanted input: {cfg.input_name.upper()} ({cfg.input_app}); "
           f"mirror rule: displays on -> TV on+{cfg.input_name.upper()}, displays off -> TV off"
-          f"{' (only if on our input)' if cfg.only_off_when_on_input else ''}")
+          f"{' (shared TV: not while someone else is watching)' if cfg.shared_tv else ''}")
+    if cfg.release_display:
+        print(f"Release display (ROKU_RELEASE_DISPLAY): on, checked every "
+              f"{cfg.share_poll_s:.0f}s while the displays are on")
+    if cfg.shared_tv and someone_watching(cfg, app_id):
+        print(f"Shared TV: someone is watching '{name}' - the daemon would leave the TV "
+              f"alone; run 'roku-monitor on --force' to take it")
     try:
         vol, muted = roku.audio_device()
         print(f"TV volume: {vol}{' (muted)' if muted else ''}; "
@@ -2536,7 +2840,9 @@ def _print_audio_status():
 def cmd_on(args, cfg):
     cfg.require_tv()
     roku = Roku(cfg.tv_ip, cfg.ecp_timeout, cfg.serial)
-    return 0 if ensure_on(roku, cfg) else 1
+    # SHARED is not success: `roku-monitor on && start-app` must not be told the
+    # TV is on our input while it is showing someone else's show.
+    return 0 if ensure_on(roku, cfg, force=args.force) is True else 1
 
 
 def cmd_off(args, cfg):
@@ -2555,6 +2861,9 @@ def cmd_run(args, cfg):
     elif cfg.volume:
         daemon.volume = VolumeWatcher(reconciler, daemon.stop_event)
         reconciler.pc_volume = daemon.volume.set_pc
+    if cfg.release_display:
+        daemon.guard = ShareGuard(cfg, daemon.sampler)
+        reconciler.share_cb = daemon.guard.on_app
     elif not IS_WIN:
         objs = _pw_dump_once()
         if objs is not None:
@@ -2583,9 +2892,10 @@ def main(argv=None):
     disc.add_argument("--ip", help="skip the search and read this address directly "
                                    "(for networks that do not deliver multicast)")
     sub.add_parser("status", help="show connector state, TV state and what the daemon would do")
-    sub.add_parser("on", help="turn the TV on and switch to the configured input")
+    on = sub.add_parser("on", help="turn the TV on and switch to the configured input")
+    on.add_argument("--force", action="store_true", help="ignore ROKU_SHARED_TV")
     off = sub.add_parser("off", help="turn the TV off")
-    off.add_argument("--force", action="store_true", help="ignore ROKU_ONLY_OFF_WHEN_ON_INPUT")
+    off.add_argument("--force", action="store_true", help="ignore ROKU_SHARED_TV")
     args = p.parse_args(argv)
     _make_output_lossy()
 
