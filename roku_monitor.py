@@ -3001,7 +3001,7 @@ def cmd_run(args, cfg):
     if cfg.release_display:
         daemon.guard = ShareGuard(cfg, daemon.sampler)
         reconciler.share_cb = daemon.guard.on_app
-    elif not IS_WIN:
+    if not cfg.volume and not IS_WIN:
         objs = _pw_dump_once()
         if objs is not None:
             g = PwGraph()
