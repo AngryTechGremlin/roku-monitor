@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import roku_monitor as rm  # noqa: E402
@@ -305,6 +306,187 @@ class DaemonDebounceTests(unittest.TestCase):
         self.assertEqual(d.exit_code, rm.EX_CONFIG)
         self.assertEqual(quits, [1])
         self.assertTrue(d.stop_event.is_set())
+
+
+class EchoWakeTests(unittest.TestCase):
+    """The TV's hot-plug pulse on power-off can make GNOME light the screens with
+    nobody there. Replays the sequence seen in the logs on a fake clock."""
+
+    class Sampler:
+        def __init__(self):
+            self.pc_on, self.roku = True, "driven"
+
+        def sample(self):
+            return rm.Sample(self.pc_on, self.roku, "card1-HDMI-A-1", [])
+
+    class Saver:
+        def __init__(self, answers=(True,)):
+            self.answers, self.calls = list(answers), 0
+
+        def blank(self):
+            self.calls += 1
+            return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+    def setUp(self):
+        self.t = 1000.0
+        patcher = mock.patch.object(rm.time, "monotonic", lambda: self.t)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        cfg = rm.Config({"ROKU_TV_IP": "192.0.2.40", "ROKU_OFF_DELAY_S": "10"})
+        self.s = self.Sampler()
+        self.d = rm.Daemon(cfg, self.s, DaemonDebounceTests.FakeReconciler())
+        self.d.screensaver = self.Saver()
+        self.d._initial()
+
+    def step(self, seconds, pc_on=None, roku=None):
+        self.t += seconds
+        if pc_on is not None:
+            self.s.pc_on = pc_on
+        if roku is not None:
+            self.s.roku = roku
+        self.d._tick()
+
+    def requests(self):
+        return [r[0] for r in self.d.reconciler.requests]
+
+    def tv_goes_off(self):
+        self.step(1, pc_on=False, roku="idle")  # idle blank
+        self.step(1)
+        self.step(11)                           # grace over -> OFF
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF])
+        self.step(2, roku="absent")             # the TV's hot-plug pulse
+
+    def test_hotplug_wake_goes_back_to_sleep_and_tv_stays_off(self):
+        self.tv_goes_off()
+        self.step(2, pc_on=True)                # GNOME lit the screens
+        self.assertEqual(self.d.screensaver.calls, 1)
+        self.step(1)                            # still lit while GNOME blanks
+        self.step(1, pc_on=False)
+        self.step(30)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF])
+
+    def test_a_person_waking_afterwards_turns_the_tv_on(self):
+        self.tv_goes_off()
+        self.step(2, pc_on=True)
+        self.step(1, pc_on=False)
+        self.step(60, pc_on=True)               # a real mouse move, much later
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+        self.assertEqual(self.d.screensaver.calls, 1)
+
+    def test_only_once_per_hotplug(self):
+        """A person who wakes the PC inside the window: re-blanked once, then
+        their second mouse move wins."""
+        self.tv_goes_off()
+        self.step(2, pc_on=True)
+        self.step(1, pc_on=False)
+        self.step(2, pc_on=True)                # within ECHO_WAKE_S, past the hold
+        self.step(5)                            # hold over
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+        self.assertEqual(self.d.screensaver.calls, 1)
+
+    def test_wake_long_after_hotplug_is_a_person(self):
+        self.tv_goes_off()
+        self.step(rm.ECHO_WAKE_S + 1, pc_on=True)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+        self.assertEqual(self.d.screensaver.calls, 0)
+
+    def test_no_hotplug_means_a_person(self):
+        self.step(1, pc_on=False, roku="idle")
+        self.step(1)
+        self.step(11)
+        self.step(2, pc_on=True)                # TV kept hot-plug up: nothing to blame
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+        self.assertEqual(self.d.screensaver.calls, 0)
+
+    def test_shield_still_up_retries_then_blanks(self):
+        self.d.screensaver = self.Saver([False, True])
+        self.tv_goes_off()
+        self.step(2, pc_on=True)
+        self.step(1)
+        self.assertEqual(self.d.screensaver.calls, 2)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF])
+
+    def test_no_screensaver_keeps_the_old_rule(self):
+        self.d.screensaver = self.Saver([None])
+        self.tv_goes_off()
+        self.step(2, pc_on=True)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+
+    def test_not_while_the_tv_is_on(self):
+        """A hot-plug while the PC is in use (TV input switch) never blanks anything."""
+        self.step(1, roku="absent")
+        self.step(1, roku="driven")
+        self.assertEqual(self.d.screensaver.calls, 0)
+        self.assertEqual(self.requests(), [rm.ON])
+
+    def test_pulse_return_edge_does_not_earn_a_second_blank(self):
+        """idle -> absent -> idle is one pulse: a person in the window is
+        blanked once, and their next move wins."""
+        self.tv_goes_off()                      # entered absent
+        self.step(1, pc_on=True)                # person (or echo): blanked
+        self.step(1, pc_on=False, roku="idle")  # pulse ends
+        self.step(5, pc_on=True)                # past the hold, inside the window
+        self.assertEqual(self.d.screensaver.calls, 1)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+
+    def test_tv_turned_on_with_its_remote_is_never_blamed(self):
+        self.step(1, pc_on=False, roku="idle")
+        self.step(1)
+        self.step(11)
+        self.step(1)
+        self.step(30, roku="absent")            # standby drop, seen after a gap
+        self.step(1, roku="idle")               # someone turns the TV on
+        self.step(2, pc_on=True)                # and wakes the PC
+        self.assertEqual(self.d.screensaver.calls, 0)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+
+    def test_lock_prompt_gives_up_quickly_and_turns_the_tv_on(self):
+        self.d.screensaver = self.Saver([False])  # shield stays up: locked
+        self.tv_goes_off()
+        self.step(1, pc_on=True)
+        self.step(1)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF])  # still waiting out the wind-down
+        self.step(1)                            # past ECHO_SHIELD_S
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+        self.assertEqual(self.d.screensaver.calls, 3)
+
+    def test_resume_is_a_person_even_right_after_a_pulse(self):
+        self.tv_goes_off()                      # pulse armed at this moment
+        self.d.sleeping = True
+        self.d._forget_echo()                   # what PrepareForSleep(true) does
+        self.step(1)
+        self.d.sleeping = False
+        self.d._forget_echo()                   # and resume
+        self.step(1, pc_on=True)
+        self.assertEqual(self.d.screensaver.calls, 0)
+        self.assertEqual(self.requests(), [rm.ON, rm.OFF, rm.ON])
+
+    def test_edge_after_a_gap_is_not_armed(self):
+        """Suspend stops the monotonic clock; an edge seen across a gap
+        happened at an unknown time."""
+        self.step(1, pc_on=False, roku="idle")
+        self.step(1)
+        self.step(11)
+        self.step(1)
+        self.step(40, roku="absent")
+        self.step(1, pc_on=True)
+        self.assertEqual(self.d.screensaver.calls, 0)
+
+    def test_not_armed_while_sleeping(self):
+        self.step(1, pc_on=False, roku="idle")
+        self.step(1)
+        self.step(11)
+        self.step(1)
+        self.d.sleeping = True
+        self.step(1, roku="absent")
+        self.d.sleeping = False
+        self.step(1, pc_on=True)
+        self.assertEqual(self.d.screensaver.calls, 0)
+
+    def test_windows_and_no_gi_paths_have_no_screensaver(self):
+        d = rm.Daemon(rm.Config({"ROKU_TV_IP": "192.0.2.40"}), self.s,
+                      DaemonDebounceTests.FakeReconciler())
+        self.assertIsNone(d.screensaver)
 
 
 class WrongDeviceTests(unittest.TestCase):

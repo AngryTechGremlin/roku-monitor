@@ -81,6 +81,13 @@ VOLUME_ROUNDS = 3          # per job: send keys, re-read the TV, correct; then g
 VOLUME_KEY_GAP_S = 0.0     # measured: 20 keypresses back to back, none dropped (~40 ms each)
 VOLUME_SETTLE_S = 0.1      # the TV reports the new value at once; a small margin anyway
 VOLUME_TIMEOUT_S = 1.0     # per request, so a volume job never eats the urgent-off budget
+# A wake this soon after the TV's connector appeared or vanished, while the TV
+# is off, is GNOME reacting to the hot-plug, not a person (see GnomeScreenSaver).
+ECHO_WAKE_S = 10.0
+ECHO_HOLD_S = 5.0          # after asking GNOME to blank: it takes ~1s; do not read the
+                           # screens still lit meanwhile as a person waking them
+ECHO_SHIELD_S = 2.0        # how long a still-raised shield is waited for (its 250 ms
+                           # wind-down); longer means a lock prompt - leave it to GNOME
 KEY_QUEUE_MAX = 6          # Windows: typematic ~30/s vs the TV ~25/s; bounds hold lag to ~0.25s
 PW_DUMP_LADDER = (0, 3, 8, 15, 30, 60)  # seconds between pw-dump respawns (PipeWire restart)
 
@@ -1927,8 +1934,8 @@ class VolumeWatcher(threading.Thread):
 #
 # The kernel will not help: /sys/class/drm/*/{dpms,enabled} are read-only even
 # to root. Under Wayland only the compositor can change what is driven, so this
-# is the one place the daemon talks to a desktop environment - and only to
-# *act*, never to decide. The truth is still the kernel's (DisplaySampler);
+# is one of two places the daemon talks to a desktop environment (the other is
+# GnomeScreenSaver) - and only to *act*, never to decide. The truth is still the kernel's (DisplaySampler);
 # Mutter is just the actuator, and the whole section is inert unless
 # ROKU_RELEASE_DISPLAY is set.
 # ---------------------------------------------------------------------------
@@ -2024,6 +2031,83 @@ class MutterDisplay:
         except Exception as e:
             log.warning("Mutter refused the monitor layout (%s)", e)
             return False
+
+
+# ---------------------------------------------------------------------------
+# Linux + GNOME: putting the screens back to sleep after the TV's own hot-plug
+# woke them.
+#
+# A Roku TV pulses HDMI hot-plug as it powers off. Mutter rebuilds the layout
+# without it, and if the pointer is now outside every screen (it was on the TV,
+# or the other monitor moved because the TV sat left of or above it) Mutter
+# moves the pointer back on screen with a real, non-synthetic motion event.
+# That counts as input: it resets the idle time, gnome-settings-daemon's
+# "user became active" watch fires and it lights the screens - with nobody
+# there. The daemon would then see displays on and turn the TV back on, and
+# everything stays lit for another full idle delay.
+#
+# The decision is still the kernel's: displays lit within ECHO_WAKE_S of the
+# TV's connector appearing or vanishing, while the TV is off. GNOME is only
+# the actuator, through the same call gnome-settings-daemon makes on lid close
+# when locking is off: org.gnome.ScreenSaver.SetActive(true). The shell raises
+# its shield (it locks only if the user's own lock setting says so), emits
+# ActiveChanged(true), and gsd blanks the screens and arms its own wake watch,
+# so real input wakes them exactly as after an ordinary idle blank.
+# ---------------------------------------------------------------------------
+
+# gnome-shell's own name for the object org.gnome.ScreenSaver relays to. It has
+# no activation file, so on another desktop the call fails at once instead of
+# starting GNOME's helper.
+SCREENSAVER = ("org.gnome.Shell.ScreenShield", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver")
+
+
+class GnomeScreenSaver:
+    """org.gnome.ScreenSaver, as much of it as this daemon needs.
+
+    `gi` stays a lazy import. Every method returns None rather than raising,
+    so a desktop without GNOME's screensaver just keeps the old behaviour.
+    """
+
+    def __init__(self):
+        self._bus = None
+        self._failed = False
+
+    def _connect(self):
+        if self._bus is not None or self._failed:
+            return self._bus is not None
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio, GLib
+            self._bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception as e:  # no python3-gi, no session bus
+            log.info("cannot reach GNOME's screensaver (%s) - a hot-plug wake will turn the TV on", e)
+            self._failed = True
+            return False
+        self._gio, self._glib = Gio, GLib
+        return True
+
+    def _call(self, method, args, ret_sig):
+        return self._bus.call_sync(SCREENSAVER[0], SCREENSAVER[1], SCREENSAVER[2], method, args,
+                                   self._glib.VariantType(ret_sig) if ret_sig else None,
+                                   self._gio.DBusCallFlags.NONE, 2000, None)
+
+    def blank(self):
+        """True: asked GNOME to blank. False: the shield is still up (it is
+        winding down after the wake - asking now would be lost), try again.
+        None: cannot ask at all."""
+        if not self._connect():
+            return None
+        try:
+            (active,) = self._call("GetActive", None, "(b)").unpack()
+            if active:
+                return False
+            self._call("SetActive", self._glib.Variant("(b)", (True,)), None)
+            return True
+        except Exception as e:  # not GNOME, or gnome-shell restarting
+            _warn_once("screensaver", "GNOME's screensaver did not answer (%s) - a hot-plug wake "
+                       "turns the TV on", e)
+            return None
 
 
 class ShareGuard:
@@ -2394,7 +2478,13 @@ class Daemon:
         self.cfg, self.sampler, self.reconciler = cfg, sampler, reconciler
         self.volume = volume       # VolumeWatcher (Linux, ROKU_VOLUME=true) or None
         self.guard = None          # ShareGuard (Linux, ROKU_RELEASE_DISPLAY=true) or None
+        self.screensaver = None    # GnomeScreenSaver (Linux) or None
         self.next_share = 0.0
+        self.hotplug_at = None     # when the TV's connector last vanished, seen live, TV off
+        self.echo_handled = None   # the hotplug_at already dealt with (one re-blank each)
+        self.echo_first = None     # when the current wake was first offered to GNOME
+        self.echo_hold = 0.0       # until then, lit displays are GNOME still blanking them
+        self.last_tick = None
         self.committed = None      # what we last asked the TV to be
         self.off_samples = 0
         self.off_deadline = None
@@ -2422,14 +2512,25 @@ class Daemon:
 
     def _tick(self):
         s = self.sampler.sample()
+        now = time.monotonic()
+        # Seen live only: a gap (suspend - the monotonic clock stops - or a
+        # stalled loop) means the edge happened at some unknown time.
+        live = self.last_tick is not None and now - self.last_tick < 3 * max(self.cfg.poll_s, 1.0)
+        self.last_tick = now
         if s.roku != self.last_roku:
             if self.last_roku is not None:
                 log.info("Roku connector %s is now %s", s.roku_name, s.roku)
+                # Only the TV vanishing, only while it is off and we are awake:
+                # the pulse's return edge, or the TV coming back because someone
+                # turned it on, is never blamed for a wake.
+                if s.roku == "absent" and live and self.committed == OFF and not self.sleeping:
+                    self.hotplug_at = now
             self.last_roku = s.roku
         if self.sleeping:
             return
-        now = time.monotonic()
         if s.pc_on:
+            if self._echo_wake(now):
+                return
             self.off_samples = 0
             if self.off_deadline is not None:
                 log.info("displays came back - TV stays on")
@@ -2451,6 +2552,38 @@ class Daemon:
             if self.off_deadline is not None and now >= self.off_deadline:
                 self.off_deadline = None
                 self._commit(OFF, "displays still off")
+
+    def _echo_wake(self, now):
+        """Displays lit right after the TV came or went while it is off: put
+        them back to sleep instead of turning the TV on. Once per hot-plug, so
+        a person waking the PC in that window only has to move the mouse again."""
+        if now < self.echo_hold:
+            return True
+        if (self.screensaver is None or self.committed != OFF or self.hotplug_at is None
+                or self.echo_handled == self.hotplug_at or now - self.hotplug_at > ECHO_WAKE_S):
+            return False
+        if self.echo_first is None:
+            self.echo_first = now
+        done = self.screensaver.blank()
+        if done is False and now - self.echo_first < ECHO_SHIELD_S:
+            return True  # the shield is still winding down from the wake; next tick
+        self.echo_handled, self.echo_first = self.hotplug_at, None
+        if not done:
+            if done is False:
+                log.info("displays woke right after the TV left HDMI, but GNOME's shield is up "
+                         "(lock screen?) - turning the TV on")
+            return False
+        self.echo_hold = now + ECHO_HOLD_S
+        log.info("displays woke %.0fs after the TV left HDMI - that was the desktop reacting to "
+                 "the TV, not a person: back to sleep, TV stays off", now - self.hotplug_at)
+        return True
+
+    def _forget_echo(self):
+        """Suspend and resume: whatever the connector did around them was not
+        seen live, and the next wake is a person's."""
+        self.hotplug_at = self.echo_first = None
+        self.echo_hold = 0.0
+        self.last_tick = None
 
     def _commit(self, target, why):
         if target == OFF and self.guard is not None:
@@ -2563,6 +2696,7 @@ class Daemon:
                 return
             if start:
                 self.sleeping = True
+                self._forget_echo()
                 log.info("system is going to sleep")
                 if self.cfg.off_on_sleep:
                     self._urgent_off("suspend")
@@ -2573,6 +2707,7 @@ class Daemon:
                 self.sleeping = False
                 self.off_samples = 0
                 self.off_deadline = None
+                self._forget_echo()
                 self._take_inhibitor()
         finally:
             if start:
@@ -2861,6 +2996,8 @@ def cmd_run(args, cfg):
     elif cfg.volume:
         daemon.volume = VolumeWatcher(reconciler, daemon.stop_event)
         reconciler.pc_volume = daemon.volume.set_pc
+    if not IS_WIN:
+        daemon.screensaver = GnomeScreenSaver()
     if cfg.release_display:
         daemon.guard = ShareGuard(cfg, daemon.sampler)
         reconciler.share_cb = daemon.guard.on_app

@@ -216,6 +216,25 @@ sampling, standby stretches of up to 9 minutes) — so in the recommended
 configuration the layout stays put; the CEC tip under *Requirements* is the
 known mitigation if yours behaves differently.
 
+**The screens waking right after the TV turns off (GNOME).** Observed since:
+the TV pulses hot-plug for a second or two as it powers off. GNOME (mutter 50)
+rebuilds the layout without it, and if the pointer is now off every screen —
+it was on the TV, or the other monitor moved because the TV sat left of or
+above it — mutter puts the pointer back with a real motion event. That counts
+as input, so gnome-settings-daemon lights the screens with nobody there, the
+daemon sees displays on, turns the TV back on, and everything stays lit for
+another full idle delay. So: displays lit within 10 s of the TV's connector
+*vanishing* — seen live, while the TV is off — are read as that echo. The
+daemon leaves the TV off and asks GNOME to blank again with
+`SetActive(true)` on gnome-shell's screensaver object — the call
+gnome-settings-daemon itself makes on lid close — so GNOME, not the daemon,
+wakes the screens on real input, and nothing is locked unless your own lock
+setting says so. Trade-off: if you happen to wake the PC inside those 10 s,
+the screens go dark once more; the next mouse move wins (once per pulse).
+Never blamed: the TV coming *back* (someone turned it on), an edge across a
+suspend, a wake while GNOME's lock prompt is up (the old rule then turns the
+TV on). Without gnome-shell on the session bus, the old rule applies.
+
 ### Linux: the volume (optional)
 
 **The problem.** An HDMI audio sink has no hardware volume (`route.hw-volume
@@ -426,6 +445,10 @@ corrected the next time the displays come back.
   placeholders. Did you run `install.sh` from inside a desktop session?
 - **My windows jumped to the other monitor** → the TV dropped hot-plug while
   off; see *How it works* and the CEC tip.
+- **The screens went dark again right after I moved the mouse** → you woke the
+  PC within 10 s of the TV dropping off HDMI, which looks like GNOME's
+  hot-plug wake; move it again. The log says "that was the desktop reacting to
+  the TV".
 - **The TV stayed on someone else's show when I sat down** → expected with
   `ROKU_SHARED_TV=true`; the daemon stood aside and will not take the screen
   back by itself. Run `roku-monitor on --force`, or lock and unlock the PC.

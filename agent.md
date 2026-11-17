@@ -22,7 +22,8 @@ reconciler thread, same bounded-retry rule, no second rule.
 ## Project rules
 - `roku_monitor.py` is the whole program, on both platforms. Python ≥ 3.10,
   **stdlib only**; `gi` (PyGObject) is imported lazily and only inside the
-  daemon's `run` path for the login1 suspend/shutdown hook, and the Windows
+  daemon's `run` path, for the login1 suspend/shutdown hook and the two GNOME
+  actuators (`MutterDisplay`, `GnomeScreenSaver`), and the Windows
   backend is `ctypes` only. Everything else — and all tests — must work
   without either (CI has no `python3-gi`, and the tests run on both runners).
   The only external programs are PipeWire's own `pw-dump` and `wpctl`, used
@@ -32,7 +33,10 @@ reconciler thread, same bounded-retry rule, no second rule.
   desktop environment's intent.** On Linux that is
   `/sys/class/drm/<connector>/{status,enabled,dpms}` — *driven* only when all
   three say so. On Windows it is `GUID_CONSOLE_DISPLAY_STATE`. Do not swap
-  either for a compositor- or session-specific signal.
+  either for a compositor- or session-specific signal. GNOME is only ever an
+  actuator: the hot-plug echo re-blank decides from sysfs (lit within
+  `ECHO_WAKE_S` of the TV's connector vanishing, seen live, TV off) and only
+  then asks gnome-shell to blank.
 - Windows decision logic lives in the pure `handle_win_event()` so it stays
   testable on Linux; the ctypes `WndProc` is only a forwarder.
 - TV power decisions key off the **global** "any connector driven" edge, never
